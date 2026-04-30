@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Project runtime
+downloads/
+*.zip
+
+# uv lock (image installs from requirements.txt)
+uv.lock

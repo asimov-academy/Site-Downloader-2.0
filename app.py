@@ -262,4 +262,6 @@ def download_file(session_id: str):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5002, threaded=True)
+    # In production (Railway/Render) gunicorn drives the app via entrypoint.sh.
+    # This block only runs for `python app.py` during local dev.
+    app.run(debug=True, port=int(os.environ.get("PORT", 5002)), threaded=True)
