@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Site Grabber</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0d0d12;
+      --surface: #16161f;
+      --border: #2a2a3a;
+      --accent: #6c63ff;
+      --accent-hover: #8b84ff;
+      --text: #e8e8f0;
+      --muted: #888;
+      --success: #22c55e;
+      --error: #ef4444;
+      --mono: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 36px;
+      width: 100%;
+      max-width: 540px;
+      box-shadow: 0 24px 64px rgba(0,0,0,.5);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 6px;
+    }
+
+    .logo svg { flex-shrink: 0; }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -.02em;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: .875rem;
+      margin-bottom: 28px;
+      line-height: 1.5;
+    }
+
+    .input-wrap {
+      position: relative;
+      margin-bottom: 14px;
+    }
+
+    input[type="url"] {
+      width: 100%;
+      padding: 14px 16px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 1rem;
+      outline: none;
+      transition: border-color .2s, box-shadow .2s;
+    }
+
+    input[type="url"]::placeholder { color: #555; }
+
+    input[type="url"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(108,99,255,.2);
+    }
+
+    input[type="url"]:disabled { opacity: .5; cursor: not-allowed; }
+
+    button#grab {
+      width: 100%;
+      padding: 14px 24px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      transition: background .2s, transform .15s, box-shadow .2s;
+    }
+
+    button#grab:hover:not(:disabled) {
+      background: var(--accent-hover);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(108,99,255,.4);
+    }
+
+    button#grab:disabled { background: #333; cursor: not-allowed; transform: none; }
+
+    .spinner {
+      width: 18px; height: 18px;
+      border: 2px solid rgba(255,255,255,.25);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .log-box {
+      margin-top: 20px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      max-height: 220px;
+      overflow-y: auto;
+      display: none;
+    }
+
+    .log-box.open { display: block; }
+
+    .log-line {
+      font-family: var(--mono);
+      font-size: .78rem;
+      color: #aaa;
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,.04);
+      animation: fadein .25s ease;
+    }
+
+    .log-line:last-child { border-bottom: none; color: #7ef0a2; }
+    .log-line.err { color: var(--error); }
+
+    @keyframes fadein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; } }
+
+    .success-bar {
+      margin-top: 16px;
+      padding: 14px 16px;
+      background: rgba(34,197,94,.12);
+      border: 1px solid rgba(34,197,94,.3);
+      border-radius: 10px;
+      display: none;
+      align-items: center;
+      gap: 12px;
+      animation: fadein .3s ease;
+    }
+
+    .success-bar.open { display: flex; }
+
+    .success-bar span { flex: 1; font-size: .9rem; color: var(--success); }
+
+    .success-bar a {
+      color: var(--success);
+      font-weight: 600;
+      font-size: .85rem;
+      text-decoration: underline;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--accent)"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="2" y1="12" x2="22" y2="12"/>
+        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10
+                 15.3 15.3 0 0 1-4-10A15.3 15.3 0 0 1 12 2z"/>
+      </svg>
+      <h1>Site Grabber</h1>
+    </div>
+    <p class="subtitle">
+      Captura um snapshot completo de qualquer site estático — CSS, JS, fontes, imagens,
+      animações e efeitos de parallax — pronto para visualização offline.
+    </p>
+
+    <div class="input-wrap">
+      <input type="url" id="url" placeholder="https://exemplo.com" autocomplete="off" />
+    </div>
+
+    <button id="grab" onclick="startGrab()">
+      <span id="btn-label">Capturar Site</span>
+      <div class="spinner" id="spin"></div>
+    </button>
+
+    <div class="log-box" id="logs"></div>
+
+    <div class="success-bar" id="ok">
+      <span>Download pronto!</span>
+      <a id="dl-link" href="#">Baixar ZIP</a>
+    </div>
+  </div>
+
+  <script>
+    let es = null;
+
+    function startGrab() {
+      const url = document.getElementById('url').value.trim();
+      if (!url) { alert('Insira uma URL válida.'); return; }
+
+      clearLogs();
+      closeSuccess();
+      setLoading(true);
+
+      fetch('/start-download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url })
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) { addLog('❌ ' + data.error, true); setLoading(false); return; }
+        listenSSE(data.session_id);
+      })
+      .catch(err => { addLog('❌ ' + err.message, true); setLoading(false); });
+    }
+
+    function listenSSE(sid) {
+      es = new EventSource('/stream/' + sid);
+
+      es.onmessage = e => addLog(e.data);
+
+      es.addEventListener('done', e => {
+        es.close();
+        if (e.data === 'complete') {
+          triggerDownload(sid);
+          showSuccess(sid);
+        }
+        setTimeout(() => setLoading(false), 500);
+      });
+
+      es.onerror = () => { es.close(); setLoading(false); };
+    }
+
+    function triggerDownload(sid) {
+      const a = document.createElement('a');
+      a.href = '/download-file/' + sid;
+      a.click();
+      document.getElementById('dl-link').href = '/download-file/' + sid;
+    }
+
+    function setLoading(on) {
+      document.getElementById('grab').disabled = on;
+      document.getElementById('url').disabled = on;
+      document.getElementById('spin').style.display = on ? 'block' : 'none';
+      document.getElementById('btn-label').textContent = on ? 'Processando...' : 'Capturar Site';
+      if (on) document.getElementById('logs').classList.add('open');
+    }
+
+    function addLog(msg, isErr = false) {
+      const box = document.getElementById('logs');
+      const d = document.createElement('div');
+      d.className = 'log-line' + (isErr ? ' err' : '');
+      d.textContent = msg;
+      box.appendChild(d);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function clearLogs() {
+      // Only clear contents — visibility is controlled by setLoading()
+      document.getElementById('logs').innerHTML = '';
+    }
+
+    function showSuccess(sid) {
+      document.getElementById('ok').classList.add('open');
+    }
+
+    function closeSuccess() {
+      document.getElementById('ok').classList.remove('open');
+    }
+
+    document.getElementById('url').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !document.getElementById('grab').disabled) startGrab();
+    });
+  </script>
+</body>
+</html>
