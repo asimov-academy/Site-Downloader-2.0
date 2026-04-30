@@ -184,6 +184,10 @@ def start_download():
     if not url:
         return jsonify({"error": "URL é obrigatória"}), 400
 
+    # Auto-prefix scheme so users can paste "example.com" or "//example.com"
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url.lstrip("/")
+
     sid = str(uuid.uuid4())
     with _lock:
         _queues[sid] = queue.Queue()

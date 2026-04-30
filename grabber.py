@@ -300,20 +300,30 @@ class SiteGrabber:
         Returns (html_content, base_url) or (None, None) if no suitable frame found.
         """
         # --- Is the outer page a thin wrapper? ---
-        try:
-            body_len = page.evaluate("() => document.body.innerText.trim().length")
-            # Count ALL iframes regardless of src (src may be set dynamically by JS)
-            iframe_count = page.evaluate("""
-                () => document.querySelectorAll('iframe').length
-            """)
-            # Also check for fullscreen iframes via CSS cover ratio
-            cover_ratio_max = page.evaluate("""
-                () => Math.max(0, ...Array.from(document.querySelectorAll('iframe')).map(f =>
-                    (f.offsetWidth * f.offsetHeight) / (window.innerWidth * window.innerHeight)
-                ))
-            """)
-        except Exception:
-            return None, None
+        # The iframe wrapper may appear/grow asynchronously after the initial
+        # render (Aura site builders inject it via React). Poll up to 6 s for
+        # signs that we're on a wrapper page.
+        body_len = 0
+        iframe_count = 0
+        cover_ratio_max = 0.0
+        for _ in range(6):
+            try:
+                body_len = page.evaluate("() => document.body.innerText.trim().length")
+                iframe_count = page.evaluate(
+                    "() => document.querySelectorAll('iframe').length"
+                )
+                cover_ratio_max = page.evaluate("""
+                    () => Math.max(0, ...Array.from(document.querySelectorAll('iframe')).map(f =>
+                        (f.offsetWidth * f.offsetHeight) / (window.innerWidth * window.innerHeight)
+                    ))
+                """)
+            except Exception:
+                return None, None
+
+            # Found a fullscreen iframe → enough signal to commit to the wrapper path
+            if iframe_count > 0 and cover_ratio_max >= 0.75:
+                break
+            page.wait_for_timeout(1000)
 
         if iframe_count == 0:
             return None, None
@@ -669,6 +679,18 @@ class SiteGrabber:
             for attr in ("integrity", "crossorigin", "nonce"):
                 tag.attrs.pop(attr, None)
 
+        # Reset post-init markers from libraries that "remember" they've already
+        # initialized via DOM attributes/canvas children. When we capture the
+        # rendered DOM, those markers are baked in — and the next page load sees
+        # them, skips re-init, and the visual element (canvas) stays empty.
+        # Pattern is generic: any element whose existence relies on a JS lib
+        # finding a placeholder div + creating a child <canvas>.
+        for el in soup.find_all(attrs={"data-us-project": True}):
+            for attr in ("data-us-initialized", "data-scene-id"):
+                el.attrs.pop(attr, None)
+            for canvas in el.find_all("canvas"):
+                canvas.decompose()
+
         # ── <script src> ──────────────────────────────────────────────────────
         self.log("📝 Processando scripts...")
 
@@ -797,6 +819,13 @@ class SiteGrabber:
                 "html,body{opacity:1!important;visibility:visible!important}\n"
                 ".page-loader,.site-loader,[class*='loading-screen'],"
                 "[id*='loading-screen']{display:none!important}\n"
+                "/* GSAP ScrollTrigger pin-spacer: when pinning fails locally,\n"
+                "   the spacer's reserved scroll-distance becomes a black gap.\n"
+                "   Collapse it to its content's natural height. */\n"
+                ".pin-spacer{height:auto!important;min-height:0!important;\n"
+                "  padding:0!important;max-height:none!important}\n"
+                ".pin-spacer>*{position:relative!important;\n"
+                "  inset:auto!important;top:auto!important;left:auto!important}\n"
             )
             head.append(style)
 
@@ -898,6 +927,17 @@ class SiteGrabber:
                 "  });\n"
                 "  if (window.console && n) console.log('[offline-fix] revealed', n);\n"
                 "}\n"
+                "// UnicornStudio (and similar libs that load dynamically via an inline\n"
+                "// loader) self-skip when window.UnicornStudio already exists — but we\n"
+                "// captured both the loaded UMD script AND the inline loader, so the\n"
+                "// loader bails and init() never runs. Force it.\n"
+                "function initUnicornStudio(){\n"
+                "  if (window.UnicornStudio && typeof window.UnicornStudio.init === 'function'\n"
+                "      && !window.UnicornStudio.isInitialized) {\n"
+                "    try { window.UnicornStudio.init(); window.UnicornStudio.isInitialized = true; }\n"
+                "    catch(e){ if(window.console) console.warn('[offline-fix] UnicornStudio init failed:', e); }\n"
+                "  }\n"
+                "}\n"
                 "// Initial sweep\n"
                 "fixAll();\n"
                 "// React/Next.js will re-render imgs after hydration — watch for that\n"
@@ -920,7 +960,12 @@ class SiteGrabber:
                 "setTimeout(fixAll, 1000);\n"
                 "setTimeout(fixAll, 3000);\n"
                 "// Wait for animations to play before forcing visibility\n"
-                "var go = function(){ setTimeout(reveal, 5000); };\n"
+                "var go = function(){\n"
+                "  setTimeout(reveal, 5000);\n"
+                "  initUnicornStudio();\n"
+                "  setTimeout(initUnicornStudio, 500);\n"
+                "  setTimeout(initUnicornStudio, 2000);\n"
+                "};\n"
                 "if (document.readyState === 'complete') go();\n"
                 "else window.addEventListener('load', go);\n"
                 "})();"
@@ -1095,40 +1140,6 @@ class SiteGrabber:
         with open(os.path.join(self.output_dir, "index.html"), "w", encoding="utf-8") as f:
             f.write(final_html)
 
-        # Helper: small launcher script so the user can view the captured site
-        # over HTTP (some browsers block ESM/CORS over file://).
-        self._write_serve_script()
-
         asset_count = len(os.listdir(self.assets_dir))
         self.log(f"✅ Concluído! {asset_count} arquivos em assets/")
-        self.log("ℹ️  Para visualizar: cd no diretório e rode `python3 serve.py`")
         return True
-
-    def _write_serve_script(self) -> None:
-        """Write a minimal HTTP server launcher next to index.html."""
-        script = (
-            "#!/usr/bin/env python3\n"
-            '"""Launch a local HTTP server and open the captured site in the browser."""\n'
-            "import http.server, socketserver, webbrowser, os, sys\n"
-            "\n"
-            "PORT = 8765\n"
-            "os.chdir(os.path.dirname(os.path.abspath(__file__)))\n"
-            "\n"
-            "class Handler(http.server.SimpleHTTPRequestHandler):\n"
-            "    def log_message(self, *a, **k): pass\n"
-            "\n"
-            "with socketserver.TCPServer(('', PORT), Handler) as httpd:\n"
-            "    url = f'http://localhost:{PORT}/'\n"
-            "    print(f'→ {url}')\n"
-            "    try: webbrowser.open(url)\n"
-            "    except Exception: pass\n"
-            "    try: httpd.serve_forever()\n"
-            "    except KeyboardInterrupt: print('\\nbye')\n"
-        )
-        path = os.path.join(self.output_dir, "serve.py")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(script)
-        try:
-            os.chmod(path, 0o755)
-        except Exception:
-            pass

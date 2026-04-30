@@ -117,3 +117,6 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Runtime artifacts (downloaded sites + zips)
+downloads/
