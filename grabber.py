@@ -877,6 +877,31 @@ class SiteGrabber:
             for canvas in el.find_all("canvas"):
                 canvas.decompose()
 
+        # Aura "WebGL Image Reveal" pattern (aris-photograph and similar
+        # photography templates): the page's inline JS walks every <img>,
+        # creates a sibling <canvas>, copies originalImg.src into a
+        # `new Image()` with crossOrigin='anonymous', uploads as a WebGL
+        # texture, then sets the img's data-webgl-init="true" + display:none.
+        # Two captured-state problems:
+        #   (a) the marker makes the script's guard bail, leaving canvas blank
+        #   (b) if originalImg.src points to a local file://, the new
+        #       crossOrigin Image fails CORS on file:// → texture never loads
+        # Fix: decompose the orphan sibling canvas, clear the inline
+        # display:none, and KEEP src pointing to the original CDN URL (skipped
+        # below in the media rewrite). The marker is preserved here as a flag
+        # for the media-rewrite phase and removed at the end.
+        webgl_imgs = soup.find_all("img", attrs={"data-webgl-init": True})
+        for img in webgl_imgs:
+            prev = img.find_previous_sibling()
+            if prev is not None and getattr(prev, "name", None) == "canvas":
+                prev.decompose()
+            sty = img.get("style", "") or ""
+            new_sty = re.sub(r"display\s*:\s*none\s*;?\s*", "", sty).strip().rstrip(";").strip()
+            if new_sty:
+                img["style"] = new_sty
+            elif "style" in img.attrs:
+                del img["style"]
+
         # ── <script src> ──────────────────────────────────────────────────────
         self.log("📝 Processando scripts...")
 
@@ -934,6 +959,12 @@ class SiteGrabber:
         self.log("🖼️  Processando imagens e mídia...")
         media_done = 0
         for tag in soup.find_all(["img", "source", "video", "audio", "track"]):
+            # Aura WebGL Image Reveal: keep CDN URL so runtime new Image
+            # (with crossOrigin='anonymous') gets proper CORS headers.
+            # Otherwise file:// breaks WebGL texture upload.
+            if tag.name == "img" and tag.get("data-webgl-init"):
+                continue
+
             # Lazy-load data-src variants → promote to src
             for lazy_attr in ("data-src", "data-lazy-src", "data-original", "data-url"):
                 val = tag.get(lazy_attr)
@@ -969,6 +1000,11 @@ class SiteGrabber:
                         media_done += 1
 
         self.log(f"   ✅ {media_done} elementos de mídia processados")
+
+        # Now that the media-rewrite phase is past, drop the WebGL marker
+        # so the page's reveal script re-runs cleanly on load.
+        for img in webgl_imgs:
+            img.attrs.pop("data-webgl-init", None)
 
         # ── Inline style attributes ────────────────────────────────────────────
         self.log("✨ Processando estilos inline...")
