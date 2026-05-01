@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Site Grabber</title>
+  <title>Asimov Site Downloader</title>
+  <meta name="description" content="Baixe qualquer site para visualização offline — HTML, CSS, JS, fontes, imagens e vídeos preservando animações e renderizações dinâmicas." />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%25' stop-color='%237c6cff'/><stop offset='100%25' stop-color='%235b4fd1'/></linearGradient></defs><rect width='32' height='32' rx='8' fill='url(%23g)'/><path d='M16 8 V20 M10 16 L16 22 L22 16' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/><rect x='9' y='24' width='14' height='2' rx='1' fill='white'/></svg>" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -179,18 +181,27 @@
 <body>
   <div class="card">
     <div class="logo">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--accent)"
-           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="10"/>
-        <line x1="2" y1="12" x2="22" y2="12"/>
-        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10
-                 15.3 15.3 0 0 1-4-10A15.3 15.3 0 0 1 12 2z"/>
+      <svg width="36" height="36" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="logoGrad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#8b84ff"/>
+            <stop offset="100%" stop-color="#5b4fd1"/>
+          </linearGradient>
+        </defs>
+        <rect x="1" y="1" width="30" height="30" rx="8" fill="url(#logoGrad)"
+              stroke="rgba(255,255,255,.08)" stroke-width="1"/>
+        <circle cx="16" cy="13" r="5.5" stroke="#fff" stroke-width="1.4" fill="none" opacity=".95"/>
+        <ellipse cx="16" cy="13" rx="2.4" ry="5.5" stroke="#fff" stroke-width="1.4" fill="none" opacity=".95"/>
+        <line x1="10.5" y1="13" x2="21.5" y2="13" stroke="#fff" stroke-width="1.4" opacity=".95"/>
+        <path d="M16 21 L16 26 M12.5 23 L16 26.5 L19.5 23"
+              stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
       </svg>
-      <h1>Site Grabber</h1>
+      <h1>Asimov Site Downloader</h1>
     </div>
     <p class="subtitle">
-      Captura um snapshot completo de qualquer site estático — CSS, JS, fontes, imagens,
-      animações e efeitos de parallax — pronto para visualização offline.
+      Insira a URL de qualquer site e receba um ZIP com a versão offline completa —
+      HTML, CSS, JavaScript, fontes, imagens e vídeos. Preserva animações, parallax
+      e sites renderizados via JavaScript (Next.js, SPAs, Webflow, Aura).
     </p>
 
     <div class="input-wrap">
@@ -198,7 +209,7 @@
     </div>
 
     <button id="grab" onclick="startGrab()">
-      <span id="btn-label">Capturar Site</span>
+      <span id="btn-label">Baixar Site</span>
       <div class="spinner" id="spin"></div>
     </button>
 
@@ -262,7 +273,7 @@
       document.getElementById('grab').disabled = on;
       document.getElementById('url').disabled = on;
       document.getElementById('spin').style.display = on ? 'block' : 'none';
-      document.getElementById('btn-label').textContent = on ? 'Processando...' : 'Capturar Site';
+      document.getElementById('btn-label').textContent = on ? 'Processando...' : 'Baixar Site';
       if (on) document.getElementById('logs').classList.add('open');
     }
 

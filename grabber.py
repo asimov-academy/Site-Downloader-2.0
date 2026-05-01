@@ -17,6 +17,7 @@ Design goals
   • Fallback requests download for assets whose CDN URL differed from what Playwright saw.
 """
 
+import base64
 import os
 import re
 import hashlib
@@ -247,7 +248,69 @@ class SiteGrabber:
             return f'@import "{ref}"' if ref else m.group(0)
 
         css_text = import_re.sub(replace_import, css_text)
+
+        # Chrome blocks file:// fetches for mask-image (treats them as
+        # cross-origin) and the masked element renders fully invisible.
+        # Inline the mask images as data: URIs so they bypass the network.
+        css_text = self._inline_mask_data_uris(css_text)
         return css_text
+
+    # ── Mask-image data: URI inlining ─────────────────────────────────────────
+
+    _MASK_MIME = {
+        ".png":  "image/png",  ".jpg":  "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif":  "image/gif",  ".svg":  "image/svg+xml", ".webp": "image/webp",
+        ".avif": "image/avif",
+    }
+
+    def _local_ref_to_path(self, ref: str) -> str | None:
+        """Resolve 'assets/foo.png' or bare 'foo.png' against assets_dir."""
+        if not ref or ref.startswith(("data:", "http:", "https:", "//", "#")):
+            return None
+        if ref.startswith("assets/"):
+            ref = ref[len("assets/"):]
+        if "/" in ref or ref in ("", "."):
+            return None
+        path = os.path.join(self.assets_dir, ref)
+        return path if os.path.isfile(path) else None
+
+    def _to_data_uri(self, path: str) -> str | None:
+        ext = os.path.splitext(path)[1].lower()
+        mime = self._MASK_MIME.get(ext)
+        if not mime:
+            return None
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception:
+            return None
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+    # Match `mask-image:`, `-webkit-mask-image:`, `mask:` or `-webkit-mask:`
+    # declarations and capture every url(...) inside them.
+    _MASK_DECL_RE = re.compile(
+        r"((?:-webkit-)?mask(?:-image)?\s*:\s*[^;{}]*?)"
+        r"url\(\s*(['\"]?)([^)'\"\s]+)\2\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _inline_mask_data_uris(self, css_text: str) -> str:
+        """Replace url() inside mask declarations with data: URIs."""
+        if "mask" not in css_text.lower():
+            return css_text
+
+        def replace(m: re.Match) -> str:
+            prefix, quote, ref = m.group(1), m.group(2), m.group(3)
+            path = self._local_ref_to_path(ref)
+            if not path:
+                return m.group(0)
+            data_uri = self._to_data_uri(path)
+            if not data_uri:
+                return m.group(0)
+            return f"{prefix}url({quote}{data_uri}{quote})"
+
+        # Apply repeatedly because one declaration may have multiple url()s
+        return self._MASK_DECL_RE.sub(replace, css_text)
 
     # ── Playwright helpers ────────────────────────────────────────────────────
 
@@ -270,6 +333,48 @@ class SiteGrabber:
             window.chrome = window.chrome || { runtime: {} };
         """)
         return context
+
+    def _serialize_runtime_stylesheets(self, page_or_frame) -> None:
+        """
+        Force CSSOM-only stylesheets back into <style> text content.
+
+        styled-components (and other CSS-in-JS libs) read the SSR <style>
+        element on hydration, take ownership, and *empty its textContent*
+        while keeping the rules live in `document.styleSheets[i].cssRules`.
+        Constructable stylesheets via `document.adoptedStyleSheets` are
+        even worse: they have no <style> element at all.
+
+        Either way, `page.content()` returns outerHTML which only sees
+        literal <style> text — not CSSOM rules — so the snapshot loses
+        all post-hydration styling. Call this BEFORE page.content() to
+        materialise everything back into the DOM.
+        """
+        page_or_frame.evaluate("""() => {
+          // 1) Re-fill empty <style> elements whose CSSOM rules still exist.
+          for (const sheet of document.styleSheets) {
+            const owner = sheet.ownerNode;
+            if (!owner || owner.tagName !== 'STYLE') continue;
+            if ((owner.textContent || '').trim().length > 0) continue;
+            try {
+              const txt = Array.from(sheet.cssRules || [])
+                .map(r => r.cssText).join('\\n');
+              if (txt) owner.textContent = txt;
+            } catch (e) { /* cross-origin sheet — unreadable */ }
+          }
+          // 2) Materialise constructable stylesheets (adoptedStyleSheets).
+          const adopted = document.adoptedStyleSheets || [];
+          for (let i = 0; i < adopted.length; i++) {
+            try {
+              const txt = Array.from(adopted[i].cssRules || [])
+                .map(r => r.cssText).join('\\n');
+              if (!txt) continue;
+              const el = document.createElement('style');
+              el.setAttribute('data-adopted', String(i));
+              el.textContent = txt;
+              (document.head || document.documentElement).appendChild(el);
+            } catch (e) {}
+          }
+        }""")
 
     def _navigate(self, page, url: str) -> None:
         """Try progressively relaxed wait conditions until the page loads."""
@@ -395,6 +500,13 @@ class SiteGrabber:
         except Exception:
             pass
         page.wait_for_timeout(1500)
+
+        # Materialise CSSOM-only stylesheets (styled-components, emotion,
+        # adoptedStyleSheets) so frame.content() can serialise them.
+        try:
+            self._serialize_runtime_stylesheets(frame)
+        except Exception as exc:
+            self.log(f"⚠️  Serializar CSSOM (frame): {exc}")
 
         self.log(f"✓ Conteúdo do frame capturado ({frame_url[:70] or 'srcdoc'})")
         return frame.content(), base
@@ -661,9 +773,59 @@ class SiteGrabber:
         if not body:
             return False
         text = (body.get_text(strip=True) or "")
+        # SPA root marker (Vite/CRA, Next.js, Nuxt) + nearly-empty body → definite CSR
+        spa_root = body.find(id=re.compile(r"^(root|app|__next|__nuxt)$"))
+        if spa_root is not None and len(text) < 200:
+            return True
+        # Fallback heuristic: tiny body with very few divs (generic SPA shell)
         divs = body.find_all("div")
-        # CSR signal: very little text AND only 1-2 top-level divs (SPA root shell)
         return len(text) < 50 and len(divs) <= 3
+
+    def _detect_csr_from_origin(self) -> bool:
+        """
+        Fetch the ORIGINAL server HTML (no JS executed) and check if it's an
+        SPA shell. The Playwright-rendered DOM is always full of content for
+        SPAs (because React/Vue has mounted), so _detect_csr applied to it
+        always returns False. The pre-JS HTML is what reveals the real shape.
+        """
+        try:
+            r = requests.get(
+                self.url,
+                timeout=10,
+                verify=False,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+                },
+            )
+            if r.status_code == 200 and r.text:
+                return self._detect_csr(r.text)
+        except Exception:
+            pass
+        return False
+
+    def _detect_nextjs_app_router(self, html: str) -> bool:
+        """
+        Next.js 13+ App Router with React streaming SSR. The body is fully
+        server-rendered (so the empty-shell heuristic misses it), but the
+        hydration runtime is just as destructive offline as CSR: webpack
+        rebuilds chunk URLs at runtime, route prefetches hit /_next/data/,
+        CSS chunks load lazily, and the $RC() Suspense swap re-runs against
+        a DOM that's already been resolved. Treat as CSR.
+        """
+        if "/_next/static/chunks/" not in html:
+            return False
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.find("meta", attrs={"name": "next-size-adjust"}) is not None:
+            return True
+        if soup.find("script", id="_R_") is not None:
+            return True
+        if soup.find("template", id=re.compile(r"^B:\d+$")) is not None:
+            return True
+        return False
 
     # ── HTML processing ───────────────────────────────────────────────────────
 
@@ -678,6 +840,30 @@ class SiteGrabber:
         for tag in soup.find_all(["script", "link"]):
             for attr in ("integrity", "crossorigin", "nonce"):
                 tag.attrs.pop(attr, None)
+
+        # Neutralize JS smooth-scroll libraries (Lenis, etc.). These attach a
+        # `wheel` listener that preventDefault()s the event and animates scroll
+        # via RAF. Offline that animation loop usually breaks (init failures,
+        # missing deps), and the page becomes scroll-locked — wheel/trackpad
+        # gestures land on the listener but the scroll position never updates.
+        # Runs in both CSR and non-CSR modes.
+        SMOOTH_SCROLL_CLASS_PREFIXES = ("lenis",)  # extend if more libs surface
+        SMOOTH_SCROLL_SCRIPT_NAMES = ("lenis",)
+        html_root = soup.find("html")
+        if html_root is not None:
+            cls = html_root.get("class") or []
+            if isinstance(cls, str):
+                cls = cls.split()
+            kept = [c for c in cls if not any(c.startswith(p) for p in SMOOTH_SCROLL_CLASS_PREFIXES)]
+            if kept != cls:
+                if kept:
+                    html_root["class"] = kept
+                else:
+                    del html_root["class"]
+        for tag in soup.find_all("script", src=True):
+            src_lower = (tag.get("src") or "").lower()
+            if any(name in src_lower for name in SMOOTH_SCROLL_SCRIPT_NAMES):
+                tag.decompose()
 
         # Reset post-init markers from libraries that "remember" they've already
         # initialized via DOM attributes/canvas children. When we capture the
@@ -701,12 +887,28 @@ class SiteGrabber:
             for tag in soup.find_all("script"):
                 tag.decompose()
                 removed += 1
-            for tag in soup.find_all("link", rel=lambda r: r and any(
-                x in (r if isinstance(r, str) else " ".join(r))
-                for x in ("preload", "modulepreload", "prefetch")
-            )):
+            # Skip preloads/prefetches that the now-removed scripts would have used,
+            # but spare font preloads — the CSS @font-face still needs the bytes.
+            def _is_strippable_link(tag):
+                rel = tag.get("rel", [])
+                rel_str = rel if isinstance(rel, str) else " ".join(rel or [])
+                if not any(x in rel_str for x in ("preload", "modulepreload", "prefetch")):
+                    return False
+                return tag.get("as", "") != "font"
+            for tag in soup.find_all("link"):
+                if _is_strippable_link(tag):
+                    tag.decompose()
+            # Streaming Suspense leftovers from React 19: the swap already
+            # happened during capture, but empty <template id="B:N"> shells
+            # remain. Harmless visually but not useful either; clean up.
+            tmpl_removed = 0
+            for tag in soup.find_all("template", id=re.compile(r"^B:\d+$")):
                 tag.decompose()
-            self.log(f"   🛡️  App CSR detectado — {removed} scripts removidos (conteúdo já no DOM)")
+                tmpl_removed += 1
+            note = f"{removed} scripts removidos"
+            if tmpl_removed:
+                note += f", {tmpl_removed} <template> de streaming"
+            self.log(f"   🛡️  App CSR detectado — {note} (conteúdo já no DOM)")
         else:
             scripts_done = 0
             for tag in soup.find_all("script", src=True):
@@ -809,80 +1011,77 @@ class SiteGrabber:
                         data_done += 1
         self.log(f"   ✅ {data_done} atributos de dados reescritos")
 
-        # ── Inject offline-compatibility CSS + reveal-fallback JS ─────────────
+        # ── Inject offline-compatibility CSS ─────────────────────────────────
         head = soup.find("head")
         if head:
             style = soup.new_tag("style")
             style["data-offline"] = "1"
-            style.string = (
+            css = (
                 "/* offline: ensure content is visible regardless of JS init state */\n"
                 "html,body{opacity:1!important;visibility:visible!important}\n"
                 ".page-loader,.site-loader,[class*='loading-screen'],"
                 "[id*='loading-screen']{display:none!important}\n"
-                "/* GSAP ScrollTrigger pin-spacer: when pinning fails locally,\n"
-                "   the spacer's reserved scroll-distance becomes a black gap.\n"
-                "   Collapse it to its content's natural height. */\n"
-                ".pin-spacer{height:auto!important;min-height:0!important;\n"
-                "  padding:0!important;max-height:none!important}\n"
-                ".pin-spacer>*{position:relative!important;\n"
-                "  inset:auto!important;top:auto!important;left:auto!important}\n"
             )
+            if self._is_csr:
+                # GSAP ScrollTrigger pin-spacer: only collapse when scripts are
+                # stripped — without GSAP running the spacer's reserved scroll
+                # distance becomes a black gap. When scripts run (non-CSR), GSAP
+                # actually pins and NEEDS the computed height to provide the
+                # scroll-through animation distance; forcing it to auto would
+                # collapse multi-viewport sticky animations into one screen.
+                css += (
+                    "/* GSAP ScrollTrigger pin-spacer (CSR mode only): without\n"
+                    "   GSAP running, the spacer leaves a black gap of reserved\n"
+                    "   scroll. Collapse it to its content's natural height. */\n"
+                    ".pin-spacer{height:auto!important;min-height:0!important;\n"
+                    "  padding:0!important;max-height:none!important}\n"
+                    ".pin-spacer>*{position:relative!important;\n"
+                    "  inset:auto!important;top:auto!important;left:auto!important}\n"
+                )
+            style.string = css
             head.append(style)
 
-        body = soup.find("body")
-        if body:
-            # Build the image-only URL → local-path map. We use this client-side
-            # to handle two cases that pure HTML rewriting can't:
-            #   1. Sites whose JS (Next.js Image, dynamic React img setters…) re-
-            #      writes <img src> *after* hydration to URLs like
-            #      `/_next/image?url=…&w=…&q=…` — those resolve to file:// in the
-            #      saved page and 404.
-            #   2. Bare CDN URLs (Sanity, Contentful) substituted in by client-side
-            #      JS even though we already rewrote the static src in HTML.
+        # ── Inject early URL-resolver script (top of <head>) ──────────────────
+        # Frameworks like Next.js construct asset URLs at runtime
+        # (e.g. `/_next/static/chunks/foo.js`) and assign them via
+        # element.src / setAttribute. We patch those setters BEFORE any other
+        # script runs so the browser fetches our local copy from `assets/`.
+        if head:
             import json as _json
-            image_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
-                          ".avif", ".ico", ".bmp")
-            image_map = {
-                orig: local
-                for orig, local in self._url_map.items()
-                if local.lower().endswith(image_exts)
-            }
-            image_map_json = _json.dumps(image_map)
+            asset_map = {orig: local for orig, local in self._url_map.items()}
+            asset_map_json = _json.dumps(asset_map)
 
-            # Combined runtime fixer:
-            #   • Reveal: undoes `opacity:0` initial states left behind by GSAP
-            #     ScrollTrigger when scroll triggers don't fire offline.
-            #   • Image rewriter: intercepts <img src/srcset> and resolves either
-            #     direct CDN URLs or `/_next/image?url=…` wrappers to local files.
-            fix = soup.new_tag("script")
-            fix["data-offline-fix"] = "1"
-            fix.string = (
+            early = soup.new_tag("script")
+            early["data-offline-resolve"] = "1"
+            early.string = (
                 "(function(){\n"
-                "var IMG_MAP = " + image_map_json + ";\n"
-                "// Pre-populate path+query keys so file:// lookups succeed even when\n"
-                "// the original map is keyed by the captured https://… URL.\n"
+                "var ASSET_MAP = " + asset_map_json + ";\n"
+                "// Pre-populate path+query keys: when opened via file://, JS\n"
+                "// resolves '/foo.js' against file://… so we lose the original\n"
+                "// origin. Indexing by pathname+search lets the lookup succeed.\n"
                 "var _add = {};\n"
-                "for (var _k in IMG_MAP) {\n"
-                "  try { var _u = new URL(_k); _add[_u.pathname + _u.search] = IMG_MAP[_k]; } catch(e){}\n"
+                "for (var _k in ASSET_MAP) {\n"
+                "  try { var _u = new URL(_k); _add[_u.pathname + _u.search] = ASSET_MAP[_k]; }\n"
+                "  catch(e){}\n"
                 "}\n"
-                "for (var _k in _add) if (!IMG_MAP[_k]) IMG_MAP[_k] = _add[_k];\n"
+                "for (var _k in _add) if (!ASSET_MAP[_k]) ASSET_MAP[_k] = _add[_k];\n"
                 "function resolveLocal(u){\n"
-                "  if (!u) return null;\n"
-                "  if (IMG_MAP[u]) return IMG_MAP[u];\n"
+                "  if (!u || typeof u !== 'string') return null;\n"
+                "  if (u.indexOf('data:') === 0 || u.indexOf('blob:') === 0) return null;\n"
+                "  if (ASSET_MAP[u]) return ASSET_MAP[u];\n"
                 "  try {\n"
                 "    var url = new URL(u, location.href);\n"
-                "    // Path+query lookup (handles file:// resolution mismatch)\n"
                 "    var pq = url.pathname + url.search;\n"
-                "    if (IMG_MAP[pq]) return IMG_MAP[pq];\n"
-                "    // Next.js image optimization endpoint — peel the inner CDN URL\n"
+                "    if (ASSET_MAP[pq]) return ASSET_MAP[pq];\n"
+                "    // Next.js image optimization wrapper — peel the inner CDN URL\n"
                 "    if (/_next\\/image$/.test(url.pathname)) {\n"
                 "      var t = url.searchParams.get('url');\n"
                 "      if (t) {\n"
-                "        var decoded = decodeURIComponent(t);\n"
-                "        if (IMG_MAP[decoded]) return IMG_MAP[decoded];\n"
-                "        var bare = decoded.split('?')[0];\n"
-                "        for (var k in IMG_MAP) {\n"
-                "          if (k.split('?')[0] === bare) return IMG_MAP[k];\n"
+                "        var dec = decodeURIComponent(t);\n"
+                "        if (ASSET_MAP[dec]) return ASSET_MAP[dec];\n"
+                "        var bare = dec.split('?')[0];\n"
+                "        for (var k in ASSET_MAP) {\n"
+                "          if (k.split('?')[0] === bare) return ASSET_MAP[k];\n"
                 "        }\n"
                 "      }\n"
                 "    }\n"
@@ -890,7 +1089,7 @@ class SiteGrabber:
                 "  return null;\n"
                 "}\n"
                 "function rewriteSrcset(s){\n"
-                "  if (!s || s.indexOf('http') === -1 && s.indexOf('/_next') === -1) return s;\n"
+                "  if (!s || typeof s !== 'string') return s;\n"
                 "  return s.split(',').map(function(it){\n"
                 "    var p = it.trim().split(/\\s+/);\n"
                 "    var loc = resolveLocal(p[0]);\n"
@@ -898,6 +1097,77 @@ class SiteGrabber:
                 "    return p.join(' ');\n"
                 "  }).join(', ');\n"
                 "}\n"
+                "// Patch property setters: el.src = '...' / el.href = '...'\n"
+                "// IMPORTANT: skip rewrite when the element has crossOrigin set.\n"
+                "// WebGL textures (UnicornStudio, Three.js, etc.) are loaded via\n"
+                "//   img.crossOrigin = 'anonymous'; img.src = 'https://cdn/...'\n"
+                "// and consumed via gl.texImage2D. file:// resources have no CORS\n"
+                "// headers, so rewriting to local makes WebGL reject the texture\n"
+                "// (Access blocked by CORS policy → black/missing 3D scene).\n"
+                "// Better to keep the original URL: works online, fails offline,\n"
+                "// matches non-patched behaviour.\n"
+                "function patchSetter(klass, prop, transform){\n"
+                "  if (!klass || !klass.prototype) return;\n"
+                "  var desc = Object.getOwnPropertyDescriptor(klass.prototype, prop);\n"
+                "  if (!desc || !desc.set) return;\n"
+                "  Object.defineProperty(klass.prototype, prop, {\n"
+                "    configurable: true,\n"
+                "    get: desc.get,\n"
+                "    set: function(v){\n"
+                "      try {\n"
+                "        if (this.crossOrigin) {\n"
+                "          /* preserve cross-origin URL — see comment above */\n"
+                "        } else if (transform === 'srcset') {\n"
+                "          v = rewriteSrcset(v);\n"
+                "        } else {\n"
+                "          var loc = resolveLocal(v); if (loc) v = loc;\n"
+                "        }\n"
+                "      } catch(e){}\n"
+                "      desc.set.call(this, v);\n"
+                "    }\n"
+                "  });\n"
+                "}\n"
+                "patchSetter(window.HTMLScriptElement, 'src');\n"
+                "patchSetter(window.HTMLLinkElement, 'href');\n"
+                "patchSetter(window.HTMLImageElement, 'src');\n"
+                "patchSetter(window.HTMLImageElement, 'srcset', 'srcset');\n"
+                "patchSetter(window.HTMLSourceElement, 'src');\n"
+                "patchSetter(window.HTMLSourceElement, 'srcset', 'srcset');\n"
+                "patchSetter(window.HTMLMediaElement, 'src');\n"
+                "patchSetter(window.HTMLIFrameElement, 'src');\n"
+                "// Patch setAttribute too — some libs use it instead of property set\n"
+                "var _setAttr = Element.prototype.setAttribute;\n"
+                "Element.prototype.setAttribute = function(name, value){\n"
+                "  try {\n"
+                "    if (typeof value === 'string' && !this.crossOrigin) {\n"
+                "      if (name === 'src' || name === 'href') {\n"
+                "        var loc = resolveLocal(value);\n"
+                "        if (loc) value = loc;\n"
+                "      } else if (name === 'srcset') {\n"
+                "        value = rewriteSrcset(value);\n"
+                "      }\n"
+                "    }\n"
+                "  } catch(e){}\n"
+                "  return _setAttr.call(this, name, value);\n"
+                "};\n"
+                "// Expose for the late-init script in body\n"
+                "window.__resolveLocal = resolveLocal;\n"
+                "window.__rewriteSrcset = rewriteSrcset;\n"
+                "})();"
+            )
+            # Insert at the very top of <head> so it runs before any other script
+            head.insert(0, early)
+
+        # ── Inject late offline-fix at end of body ────────────────────────────
+        body = soup.find("body")
+        if body:
+            fix = soup.new_tag("script")
+            fix["data-offline-fix"] = "1"
+            fix.string = (
+                "(function(){\n"
+                "var IS_CSR = " + ("true" if self._is_csr else "false") + ";\n"
+                "var resolveLocal = window.__resolveLocal || function(){return null;};\n"
+                "var rewriteSrcset = window.__rewriteSrcset || function(s){return s;};\n"
                 "function fixImg(el){\n"
                 "  if (!el || el.tagName !== 'IMG') return;\n"
                 "  var src = el.getAttribute('src');\n"
@@ -909,38 +1179,153 @@ class SiteGrabber:
                 "    if (nss !== ss) el.setAttribute('srcset', nss);\n"
                 "  }\n"
                 "}\n"
-                "function fixAll(){\n"
-                "  document.querySelectorAll('img').forEach(fixImg);\n"
+                "function fixAll(){ document.querySelectorAll('img').forEach(fixImg); }\n"
+                "function hasSlideOffset(t){\n"
+                "  // True if a transform indicates a 'parked off-screen' starting\n"
+                "  // state: translation in px (>= 30) or % (>= 5), or a matrix\n"
+                "  // with non-zero translation. Returns false for crossfade-only\n"
+                "  // companions like scale(0.9) or pure centering translateX(-50%).\n"
+                "  if (!t || t === 'none') return false;\n"
+                "  // matrix(a,b,c,d,tx,ty) — parse tx/ty; matrix3d & friends → assume slide.\n"
+                "  var matMatch = t.match(/matrix\\(([^)]+)\\)/);\n"
+                "  if (matMatch) {\n"
+                "    var parts = matMatch[1].split(',').map(function(x){return parseFloat(x.trim());});\n"
+                "    if (parts.length === 6) {\n"
+                "      if (Math.abs(parts[4]) >= 30 || Math.abs(parts[5]) >= 30) return true;\n"
+                "    } else { return true; }\n"
+                "  }\n"
+                "  if (/matrix3d/i.test(t)) return true;\n"
+                "  var px = t.match(/(-?\\d+\\.?\\d*)px/g) || [];\n"
+                "  for (var i = 0; i < px.length; i++) {\n"
+                "    if (Math.abs(parseFloat(px[i])) >= 30) return true;\n"
+                "  }\n"
+                "  var pct = t.match(/(-?\\d+\\.?\\d*)%/g) || [];\n"
+                "  for (var j = 0; j < pct.length; j++) {\n"
+                "    if (Math.abs(parseFloat(pct[j])) >= 5) return true;\n"
+                "  }\n"
+                "  return false;\n"
                 "}\n"
-                "function reveal(){\n"
+                "function isHiddenStart(s){\n"
+                "  // True if the element's inline style is parked at a 'before'\n"
+                "  // animation state. opacity:0 alone is ambiguous (could be a\n"
+                "  // crossfade companion); pair it with a slide transform OR an\n"
+                "  // explicit visibility:hidden (GSAP/SplitType signature) to be\n"
+                "  // confident it's a scroll-reveal waiting to fire.\n"
+                "  if (s.opacity !== '0' && s.visibility !== 'hidden') return false;\n"
+                "  if (s.visibility === 'hidden') return true;\n"
+                "  return hasSlideOffset(s.transform) || hasSlideOffset(s.translate);\n"
+                "}\n"
+                "function revealEl(el){\n"
+                "  var s = el.style;\n"
+                "  s.opacity = '1';\n"
+                "  if (s.visibility === 'hidden') s.visibility = 'visible';\n"
+                "  if (s.transform) s.transform = 'none';\n"
+                "  if (s.translate) s.translate = 'none';\n"
+                "  if (s.rotate)    s.rotate = 'none';\n"
+                "  if (s.scale)     s.scale = 'none';\n"
+                "  if (s.pointerEvents === 'none') s.pointerEvents = '';\n"
+                "}\n"
+                "function snapReveal(){\n"
+                "  // Safety net: any 'before-state' element still hidden gets\n"
+                "  // forced visible. Used as a deadline pass for non-CSR mode\n"
+                "  // (after GSAP/etc had a chance to play) and as a final guard.\n"
+                "  // Skip pinned-chain elements — same reason as findScrollAnchor.\n"
                 "  var n = 0;\n"
                 "  document.querySelectorAll('[style]').forEach(function(el){\n"
-                "    var s = el.style;\n"
-                "    if (s.opacity === '0' && el.offsetParent !== null) {\n"
-                "      s.opacity = '1';\n"
-                "      if (s.transform) s.transform = 'none';\n"
-                "      if (s.translate) s.translate = 'none';\n"
-                "      if (s.rotate)    s.rotate = 'none';\n"
-                "      if (s.scale)     s.scale = 'none';\n"
-                "      n++;\n"
-                "    }\n"
+                "    if (!isHiddenStart(el.style)) return;\n"
+                "    if (isInsideFixed(el)) return;\n"
+                "    revealEl(el); n++;\n"
                 "  });\n"
-                "  if (window.console && n) console.log('[offline-fix] revealed', n);\n"
+                "  if (window.console && n) console.log('[offline-fix] snap-revealed', n);\n"
                 "}\n"
-                "// UnicornStudio (and similar libs that load dynamically via an inline\n"
-                "// loader) self-skip when window.UnicornStudio already exists — but we\n"
-                "// captured both the loaded UMD script AND the inline loader, so the\n"
-                "// loader bails and init() never runs. Force it.\n"
+                "function isInsideFixed(el){\n"
+                "  var p = el;\n"
+                "  while (p && p !== document.documentElement) {\n"
+                "    if (getComputedStyle(p).position === 'fixed') return true;\n"
+                "    p = p.parentElement;\n"
+                "  }\n"
+                "  return false;\n"
+                "}\n"
+                "function findScrollAnchor(el){\n"
+                "  // Pinned-narrative sections (one position:fixed ancestor wrapping\n"
+                "  // many sequenced headings the live JS reveals one-by-one across\n"
+                "  // scroll progress) can't be orchestrated offline — revealing all\n"
+                "  // of them at once produces an overlapping mess. Skip them: leave\n"
+                "  // the parked state intact, matching the live site at scroll=0.\n"
+                "  // For sticky chains, observe the sticky container itself (fires\n"
+                "  // when the user has scrolled past its stuck threshold).\n"
+                "  if (isInsideFixed(el)) return null;\n"
+                "  var p = el;\n"
+                "  while (p && p !== document.documentElement) {\n"
+                "    if (getComputedStyle(p).position === 'sticky') return p;\n"
+                "    p = p.parentElement;\n"
+                "  }\n"
+                "  return el;\n"
+                "}\n"
+                "function progressiveReveal(){\n"
+                "  // CSR mode: scripts stripped → no GSAP/IO is going to fire.\n"
+                "  // Mimic a scroll-driven reveal: each parked element gets a\n"
+                "  // CSS transition + IntersectionObserver. As it enters viewport\n"
+                "  // we transition to the 'after' state, with a small stagger by\n"
+                "  // document order so SplitType chars still feel letter-by-letter.\n"
+                "  var targets = [];\n"
+                "  document.querySelectorAll('[style]').forEach(function(el){\n"
+                "    if (isHiddenStart(el.style)) targets.push(el);\n"
+                "  });\n"
+                "  if (!targets.length) return;\n"
+                "  var EASE = 'cubic-bezier(.16,1,.3,1)';\n"
+                "  targets.forEach(function(el){\n"
+                "    el.style.transition =\n"
+                "      'opacity .6s ' + EASE + ', transform .6s ' + EASE + ', ' +\n"
+                "      'translate .6s ' + EASE + ', scale .6s ' + EASE + ', ' +\n"
+                "      'visibility 0s linear';\n"
+                "  });\n"
+                "  if (typeof IntersectionObserver === 'undefined') {\n"
+                "    targets.forEach(revealEl);\n"
+                "    return;\n"
+                "  }\n"
+                "  // Group targets by their scroll anchor. Anchors in sticky\n"
+                "  // sections share one observation point — when that anchor\n"
+                "  // intersects, we reveal all its parked descendants.\n"
+                "  // Targets with null anchor (inside position:fixed) are skipped.\n"
+                "  var groups = new Map();\n"
+                "  targets.forEach(function(el){\n"
+                "    var anchor = findScrollAnchor(el);\n"
+                "    if (!anchor) return;\n"
+                "    if (!groups.has(anchor)) groups.set(anchor, []);\n"
+                "    groups.get(anchor).push(el);\n"
+                "  });\n"
+                "  var io = new IntersectionObserver(function(entries){\n"
+                "    entries.forEach(function(entry){\n"
+                "      if (!entry.isIntersecting) return;\n"
+                "      var children = groups.get(entry.target) || [entry.target];\n"
+                "      children.sort(function(a, b){\n"
+                "        var pos = a.compareDocumentPosition(b);\n"
+                "        return (pos & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1;\n"
+                "      });\n"
+                "      children.forEach(function(child, i){\n"
+                "        var delay = Math.min(i * 18, 700);\n"
+                "        setTimeout(function(){ revealEl(child); }, delay);\n"
+                "      });\n"
+                "      io.unobserve(entry.target);\n"
+                "    });\n"
+                "  }, { threshold: 0.05, rootMargin: '0px 0px -8% 0px' });\n"
+                "  groups.forEach(function(_, anchor){ io.observe(anchor); });\n"
+                "  // Deadline guard: anything that never intersects still gets revealed.\n"
+                "  setTimeout(snapReveal, 8000);\n"
+                "}\n"
                 "function initUnicornStudio(){\n"
+                "  // Captured page already has the loaded UMD script + the inline\n"
+                "  // loader that says `if(!window.UnicornStudio)…`. The loader bails\n"
+                "  // because UnicornStudio is already defined, so init() never runs.\n"
                 "  if (window.UnicornStudio && typeof window.UnicornStudio.init === 'function'\n"
                 "      && !window.UnicornStudio.isInitialized) {\n"
                 "    try { window.UnicornStudio.init(); window.UnicornStudio.isInitialized = true; }\n"
                 "    catch(e){ if(window.console) console.warn('[offline-fix] UnicornStudio init failed:', e); }\n"
                 "  }\n"
                 "}\n"
-                "// Initial sweep\n"
+                "// Initial img sweep + observer for hydration-time updates\n"
                 "fixAll();\n"
-                "// React/Next.js will re-render imgs after hydration — watch for that\n"
                 "var obs = new MutationObserver(function(muts){\n"
                 "  for (var i = 0; i < muts.length; i++) {\n"
                 "    var m = muts[i];\n"
@@ -956,12 +1341,17 @@ class SiteGrabber:
                 "});\n"
                 "obs.observe(document, {childList:true, subtree:true,\n"
                 "  attributes:true, attributeFilter:['src','srcset']});\n"
-                "// Periodic re-scan (catches src updates we missed)\n"
                 "setTimeout(fixAll, 1000);\n"
                 "setTimeout(fixAll, 3000);\n"
-                "// Wait for animations to play before forcing visibility\n"
                 "var go = function(){\n"
-                "  setTimeout(reveal, 5000);\n"
+                "  // CSR: scripts stripped, so 'before-state' elements stay parked\n"
+                "  // forever unless we do something. Use IntersectionObserver to\n"
+                "  // reveal them progressively as the user scrolls — preserves the\n"
+                "  // scroll-triggered animation feel for SplitType chars, etc.\n"
+                "  // Non-CSR: GSAP/Framer may still play; let them, then catch any\n"
+                "  // leftovers with a snap pass at 5 s.\n"
+                "  if (IS_CSR) progressiveReveal();\n"
+                "  else setTimeout(snapReveal, 5000);\n"
                 "  initUnicornStudio();\n"
                 "  setTimeout(initUnicornStudio, 500);\n"
                 "  setTimeout(initUnicornStudio, 2000);\n"
@@ -1065,8 +1455,25 @@ class SiteGrabber:
                     pass
                 page.wait_for_timeout(2000)
 
+                # Materialise CSSOM-only stylesheets (styled-components, emotion,
+                # adoptedStyleSheets) so page.content() can serialise them.
+                # Without this step, post-hydration styles vanish from the
+                # snapshot and the offline page renders unstyled.
+                try:
+                    self._serialize_runtime_stylesheets(page)
+                except Exception as exc:
+                    self.log(f"⚠️  Serializar CSSOM: {exc}")
+
                 html_content = page.content()
-                self._is_csr = self._detect_csr(html_content)
+                # The rendered DOM is always full for SPAs (React already mounted),
+                # so also probe the raw server HTML to catch Vite/CRA/Next shells.
+                # Next.js App Router pages are SSR'd (body has content) but their
+                # hydration runtime breaks offline just like CSR — treat as CSR.
+                self._is_csr = (
+                    self._detect_csr(html_content)
+                    or self._detect_csr_from_origin()
+                    or self._detect_nextjs_app_router(html_content)
+                )
 
             self.log(f"📦 {len(self._captured)} recursos de rede capturados")
             if self._is_csr:
