@@ -1,307 +1,972 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-BR" class="antialiased">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Asimov Site Downloader</title>
-  <meta name="description" content="Baixe qualquer site para visualização offline — HTML, CSS, JS, fontes, imagens e vídeos preservando animações e renderizações dinâmicas." />
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%25' stop-color='%237c6cff'/><stop offset='100%25' stop-color='%235b4fd1'/></linearGradient></defs><rect width='32' height='32' rx='8' fill='url(%23g)'/><path d='M16 8 V20 M10 16 L16 22 L22 16' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round' fill='none'/><rect x='9' y='24' width='14' height='2' rx='1' fill='white'/></svg>" />
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Asimov Site Downloader 2.0 — Captura offline de qualquer site</title>
+<meta name="description" content="Capture qualquer site em um ZIP offline completo. HTML, CSS, JS, fontes, imagens — preservando animações e SPAs." />
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23030303'/><rect x='8' y='8' width='16' height='16' fill='%2300ffa3'/><text x='16' y='22' font-family='monospace' font-size='14' font-weight='700' text-anchor='middle' fill='%23030303'>A</text></svg>" />
 
-    :root {
-      --bg: #0d0d12;
-      --surface: #16161f;
-      --border: #2a2a3a;
-      --accent: #6c63ff;
-      --accent-hover: #8b84ff;
-      --text: #e8e8f0;
-      --muted: #888;
-      --success: #22c55e;
-      --error: #ef4444;
-      --mono: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+<!-- Inter (display/body) + JetBrains Mono (HUD / status / mono labels) -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
+
+<!-- iconify web component runtime -->
+<script src="https://cdn.jsdelivr.net/npm/iconify-icon@2.1.0/dist/iconify-icon.min.js"></script>
+
+<style>
+  /* ============================================================
+     DESIGN TOKENS — Aetheris/Asimov void+mint palette
+     ============================================================ */
+  :root {
+    --void: #030303;
+    --panel: #080808;
+    --panel-2: #0d0d0d;
+    --mint: #00ffa3;
+    --mint-soft: rgba(0, 255, 163, 0.12);
+    --mint-dark: #00b372;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.15);
+    --sub: #888888;
+    --white: #ffffff;
+    --error: #ff5577;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--void);
+    color: #e0e0e0;
+    height: 100%;
+  }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+    background-color: var(--void);
+    background-image:
+      linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 50px 50px;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+
+  ::selection { background: var(--mint); color: var(--void); }
+
+  /* Scrollbar (only used inside log panel) */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #1f1f1f; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--mint); }
+
+  /* ============================================================
+     CANVAS BACKGROUND — particle network (mint)
+     ============================================================ */
+  .bg-canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 0;
+    opacity: 0.7;
+  }
+  .bg-glow {
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse 60% 55% at 50% 50%, rgba(0, 255, 163, 0.18), transparent 70%);
+    z-index: 1;
+    pointer-events: none;
+  }
+  .bg-vignette {
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse 100% 100% at 50% 50%, transparent 40%, rgba(3,3,3,0.55) 100%);
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  /* ============================================================
+     HUD CORNER OVERLAY (viewport-level brackets)
+     ============================================================ */
+  .hud-overlay {
+    position: fixed; inset: 0; pointer-events: none;
+    z-index: 30; padding: 18px;
+  }
+  .hud-overlay > div {
+    position: absolute;
+    width: 12px; height: 12px;
+    opacity: 0.55;
+  }
+  .hud-tl { top: 18px; left: 18px; border-top: 1px solid var(--white); border-left: 1px solid var(--white); }
+  .hud-tr { top: 18px; right: 18px; border-top: 1px solid var(--white); border-right: 1px solid var(--white); }
+  .hud-bl { bottom: 18px; left: 18px; border-bottom: 1px solid var(--white); border-left: 1px solid var(--white); }
+  .hud-br { bottom: 18px; right: 18px; border-bottom: 1px solid var(--white); border-right: 1px solid var(--white); }
+  .hud-status {
+    position: absolute;
+    bottom: 22px; left: 50%; transform: translateX(-50%);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--sub);
+    text-transform: uppercase;
+    letter-spacing: 0.24em;
+    display: flex; align-items: center; gap: 8px;
+    opacity: 0.7;
+  }
+  .hud-status .dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--mint);
+    box-shadow: 0 0 8px var(--mint);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @media (max-width: 640px) { .hud-status { display: none; } }
+
+  /* ============================================================
+     STAGE — full-viewport flex centering
+     ============================================================ */
+  .stage {
+    position: relative;
+    z-index: 10;
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 20px;
+  }
+
+  /* ============================================================
+     CARD — the centered panel
+     ============================================================ */
+  .card {
+    position: relative;
+    width: 100%;
+    max-width: 540px;
+    background: linear-gradient(180deg, rgba(10,10,10,0.92), rgba(3,3,3,0.92));
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid var(--border);
+    box-shadow:
+      0 0 0 1px rgba(0, 255, 163, 0.04),
+      0 28px 90px rgba(0, 0, 0, 0.65),
+      0 0 60px rgba(0, 255, 163, 0.08),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    transition: box-shadow 0.4s ease, transform 0.5s ease;
+    opacity: 0;
+    transform: translateY(18px);
+    animation: cardIn 0.9s cubic-bezier(0.16, 1, 0.3, 1) 0.15s forwards;
+  }
+  @keyframes cardIn {
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .card:hover {
+    box-shadow:
+      0 0 0 1px rgba(0, 255, 163, 0.08),
+      0 28px 90px rgba(0, 0, 0, 0.7),
+      0 0 80px rgba(0, 255, 163, 0.14),
+      inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  /* Mint corner brackets on the card */
+  .card .br {
+    position: absolute;
+    width: 12px; height: 12px;
+    pointer-events: none;
+    transition: width 0.3s ease, height 0.3s ease;
+  }
+  .card .br-tl { top: -1px; left: -1px; border-top: 1.5px solid var(--mint); border-left: 1.5px solid var(--mint); }
+  .card .br-tr { top: -1px; right: -1px; border-top: 1.5px solid var(--mint); border-right: 1.5px solid var(--mint); }
+  .card .br-bl { bottom: -1px; left: -1px; border-bottom: 1.5px solid var(--mint); border-left: 1.5px solid var(--mint); }
+  .card .br-br { bottom: -1px; right: -1px; border-bottom: 1.5px solid var(--mint); border-right: 1.5px solid var(--mint); }
+  .card:hover .br { width: 16px; height: 16px; }
+
+  /* Card header strip (terminal vibe) */
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--sub);
+  }
+  .card-head .left { display: flex; align-items: center; gap: 12px; }
+  .card-head .dots { display: flex; gap: 5px; }
+  .card-head .dots span {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .card-head .dots span.live {
+    background: var(--mint);
+    box-shadow: 0 0 6px var(--mint);
+  }
+  .card-head .right {
+    color: var(--mint);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .card-head .right .pulse {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--mint);
+    box-shadow: 0 0 6px var(--mint);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  .card-body {
+    padding: 36px 32px 32px;
+  }
+  @media (max-width: 480px) {
+    .card-body { padding: 28px 22px 24px; }
+  }
+
+  /* Brand row (logo + name) */
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .brand .mark {
+    width: 28px; height: 28px;
+    background: var(--mint);
+    color: var(--void);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 13px;
+    box-shadow: 0 0 14px rgba(0, 255, 163, 0.45);
+    flex-shrink: 0;
+  }
+  .brand .name {
+    font-family: 'Inter', sans-serif;
+    font-weight: 600;
+    font-size: 17px;
+    letter-spacing: -0.02em;
+    color: var(--white);
+  }
+  .brand .name .accent { color: var(--mint); }
+
+  /* Description */
+  .desc {
+    color: #a8a8a8;
+    font-size: 14.5px;
+    line-height: 1.6;
+    margin-bottom: 26px;
+    max-width: 440px;
+  }
+  .desc b { color: var(--white); font-weight: 500; }
+
+  /* Form label */
+  .form-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    color: var(--sub);
+    margin-bottom: 10px;
+  }
+  .form-label .accent { color: var(--mint); }
+
+  /* Input row */
+  .form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .input-wrap {
+    position: relative;
+    border: 1px solid var(--border-strong);
+    background: var(--void);
+    transition: border-color 0.2s, box-shadow 0.25s;
+  }
+  .input-wrap:focus-within {
+    border-color: var(--mint);
+    box-shadow: 0 0 0 1px var(--mint), 0 0 22px rgba(0, 255, 163, 0.18);
+  }
+  .input-wrap::before {
+    content: '>';
+    position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+    color: var(--mint);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px; font-weight: 600;
+    pointer-events: none;
+  }
+  .input-wrap input {
+    width: 100%;
+    padding: 15px 16px 15px 36px;
+    background: transparent;
+    border: 0;
+    color: var(--white);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.01em;
+    outline: none;
+  }
+  .input-wrap input::placeholder { color: #444; }
+  .input-wrap input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Grab button */
+  .grab-btn {
+    position: relative;
+    width: 100%;
+    background: var(--mint);
+    color: var(--void);
+    padding: 14px 24px;
+    border: 0;
+    font-family: 'Inter', sans-serif;
+    font-size: 12px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    gap: 10px;
+    transition: background 0.2s, transform 0.1s, box-shadow 0.3s;
+    box-shadow: 0 0 22px rgba(0, 255, 163, 0.35);
+    overflow: hidden;
+  }
+  .grab-btn::before {
+    content: '';
+    position: absolute;
+    top: 0; left: -100%;
+    width: 100%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent);
+    transition: left 0.6s ease;
+  }
+  .grab-btn:hover:not(:disabled)::before { left: 100%; }
+  .grab-btn:hover:not(:disabled) {
+    background: var(--white);
+    box-shadow: 0 0 30px rgba(255, 255, 255, 0.45);
+  }
+  .grab-btn:active:not(:disabled) { transform: translateY(1px); }
+  .grab-btn:disabled {
+    background: rgba(0, 255, 163, 0.18);
+    color: rgba(0, 255, 163, 0.7);
+    cursor: not-allowed;
+    box-shadow: none;
+  }
+  .grab-btn .arrow {
+    transition: transform 0.2s;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+  }
+  .grab-btn:hover:not(:disabled) .arrow { transform: translateX(4px); }
+  .spinner {
+    width: 14px; height: 14px;
+    border: 1.5px solid rgba(0, 255, 163, 0.3);
+    border-top-color: var(--mint);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    display: none;
+  }
+  .grab-btn.loading .spinner { display: block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Form footer micro-meta */
+  .form-meta {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-top: 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+  }
+  .form-meta .left { display: flex; gap: 14px; flex-wrap: wrap; }
+  .form-meta .left span { display: inline-flex; align-items: center; gap: 5px; }
+  .form-meta .left span::before {
+    content: ''; width: 4px; height: 4px;
+    background: var(--mint); border-radius: 50%;
+    box-shadow: 0 0 4px var(--mint);
+  }
+  .form-meta .right { color: var(--mint); }
+
+  /* ============================================================
+     LOG PANEL — appears below the form, expands the card down
+     ============================================================ */
+  .log-shell {
+    margin-top: 0;
+    border: 1px solid var(--border);
+    background: var(--void);
+    overflow: hidden;
+    max-height: 0;
+    opacity: 0;
+    transition:
+      max-height 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+      opacity 0.35s ease,
+      margin-top 0.35s ease;
+  }
+  .log-shell.open {
+    max-height: 280px;
+    opacity: 1;
+    margin-top: 18px;
+  }
+  .log-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(90deg, rgba(0, 255, 163, 0.04), transparent);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    color: var(--sub);
+  }
+  .log-head .left { display: flex; align-items: center; gap: 10px; }
+  .log-head .scan {
+    width: 26px; height: 3px;
+    background: linear-gradient(90deg, transparent, var(--mint), transparent);
+    box-shadow: 0 0 6px var(--mint);
+    animation: scanPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes scanPulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+  }
+  .log-head .right {
+    color: var(--mint);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .log-head .right .dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--mint); box-shadow: 0 0 6px var(--mint);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+
+  .log-body {
+    padding: 12px 14px;
+    max-height: 220px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    line-height: 1.7;
+    background: var(--void);
+    background-image:
+      repeating-linear-gradient(
+        0deg,
+        transparent 0px,
+        transparent 2px,
+        rgba(255, 255, 255, 0.012) 2px,
+        rgba(255, 255, 255, 0.012) 4px
+      );
+  }
+
+  .log-line {
+    display: flex; gap: 10px;
+    color: #b8b8b8;
+    animation: logIn 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .log-line .ts {
+    color: #555;
+    flex-shrink: 0;
+    font-size: 10px;
+    user-select: none;
+  }
+  .log-line .ic {
+    color: var(--mint);
+    flex-shrink: 0;
+    width: 14px;
+  }
+  .log-line .msg { flex: 1; word-break: break-word; }
+  .log-line.ok .msg { color: var(--mint); font-weight: 500; }
+  .log-line.err .msg { color: var(--error); }
+  .log-line.warn .msg { color: #ffd166; }
+  .log-line.dim .msg { color: #777; }
+
+  @keyframes logIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .cursor-line {
+    display: flex; gap: 10px;
+    color: var(--mint);
+  }
+  .cursor-line .ts { color: #555; flex-shrink: 0; font-size: 10px; }
+  .cursor-line .blink {
+    display: inline-block;
+    width: 7px; height: 12px;
+    background: var(--mint);
+    box-shadow: 0 0 6px var(--mint);
+    margin-left: 2px;
+    vertical-align: middle;
+    animation: blink 1s step-end infinite;
+  }
+  @keyframes blink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0; }
+  }
+
+  /* ============================================================
+     SUCCESS BAR
+     ============================================================ */
+  .success-shell {
+    margin-top: 14px;
+    border: 1px solid rgba(0, 255, 163, 0.4);
+    background: linear-gradient(135deg, rgba(0, 255, 163, 0.08), rgba(0, 255, 163, 0.02));
+    padding: 14px 16px;
+    display: none;
+    align-items: center;
+    gap: 14px;
+    position: relative;
+    overflow: hidden;
+  }
+  .success-shell.open {
+    display: flex;
+    animation: successIn 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .success-shell::before {
+    content: '';
+    position: absolute; left: 0; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--mint);
+    box-shadow: 0 0 14px var(--mint);
+  }
+  .success-icon {
+    width: 36px; height: 36px;
+    border: 1px solid var(--mint);
+    background: rgba(0, 255, 163, 0.08);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--mint);
+    flex-shrink: 0;
+    box-shadow: 0 0 14px rgba(0, 255, 163, 0.3);
+  }
+  .success-text { flex: 1; min-width: 0; }
+  .success-text .title {
+    color: var(--mint);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    margin-bottom: 3px;
+  }
+  .success-text .meta {
+    color: #c0c0c0;
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .success-text .meta b { color: var(--white); font-weight: 500; }
+  .success-link {
+    background: var(--mint);
+    color: var(--void);
+    padding: 9px 16px;
+    text-decoration: none;
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    display: inline-flex; align-items: center; gap: 7px;
+    transition: background 0.2s, box-shadow 0.2s;
+    box-shadow: 0 0 16px rgba(0, 255, 163, 0.35);
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .success-link:hover {
+    background: var(--white);
+    box-shadow: 0 0 20px rgba(255, 255, 255, 0.4);
+  }
+  @keyframes successIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @media (max-width: 480px) {
+    .success-shell { flex-direction: column; align-items: flex-start; }
+    .success-link { width: 100%; justify-content: center; }
+  }
+
+  /* Reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
     }
-
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-    }
-
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 36px;
-      width: 100%;
-      max-width: 540px;
-      box-shadow: 0 24px 64px rgba(0,0,0,.5);
-    }
-
-    .logo {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 6px;
-    }
-
-    .logo svg { flex-shrink: 0; }
-
-    h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      letter-spacing: -.02em;
-    }
-
-    .subtitle {
-      color: var(--muted);
-      font-size: .875rem;
-      margin-bottom: 28px;
-      line-height: 1.5;
-    }
-
-    .input-wrap {
-      position: relative;
-      margin-bottom: 14px;
-    }
-
-    input[type="url"] {
-      width: 100%;
-      padding: 14px 16px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      color: var(--text);
-      font-size: 1rem;
-      outline: none;
-      transition: border-color .2s, box-shadow .2s;
-    }
-
-    input[type="url"]::placeholder { color: #555; }
-
-    input[type="url"]:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(108,99,255,.2);
-    }
-
-    input[type="url"]:disabled { opacity: .5; cursor: not-allowed; }
-
-    button#grab {
-      width: 100%;
-      padding: 14px 24px;
-      background: var(--accent);
-      color: #fff;
-      border: none;
-      border-radius: 10px;
-      font-size: 1rem;
-      font-weight: 600;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-      transition: background .2s, transform .15s, box-shadow .2s;
-    }
-
-    button#grab:hover:not(:disabled) {
-      background: var(--accent-hover);
-      transform: translateY(-2px);
-      box-shadow: 0 8px 24px rgba(108,99,255,.4);
-    }
-
-    button#grab:disabled { background: #333; cursor: not-allowed; transform: none; }
-
-    .spinner {
-      width: 18px; height: 18px;
-      border: 2px solid rgba(255,255,255,.25);
-      border-top-color: #fff;
-      border-radius: 50%;
-      animation: spin .7s linear infinite;
-      display: none;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    .log-box {
-      margin-top: 20px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 14px 16px;
-      max-height: 220px;
-      overflow-y: auto;
-      display: none;
-    }
-
-    .log-box.open { display: block; }
-
-    .log-line {
-      font-family: var(--mono);
-      font-size: .78rem;
-      color: #aaa;
-      padding: 3px 0;
-      border-bottom: 1px solid rgba(255,255,255,.04);
-      animation: fadein .25s ease;
-    }
-
-    .log-line:last-child { border-bottom: none; color: #7ef0a2; }
-    .log-line.err { color: var(--error); }
-
-    @keyframes fadein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; } }
-
-    .success-bar {
-      margin-top: 16px;
-      padding: 14px 16px;
-      background: rgba(34,197,94,.12);
-      border: 1px solid rgba(34,197,94,.3);
-      border-radius: 10px;
-      display: none;
-      align-items: center;
-      gap: 12px;
-      animation: fadein .3s ease;
-    }
-
-    .success-bar.open { display: flex; }
-
-    .success-bar span { flex: 1; font-size: .9rem; color: var(--success); }
-
-    .success-bar a {
-      color: var(--success);
-      font-weight: 600;
-      font-size: .85rem;
-      text-decoration: underline;
-      white-space: nowrap;
-    }
-  </style>
+  }
+</style>
 </head>
+
 <body>
-  <div class="card">
-    <div class="logo">
-      <svg width="36" height="36" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <defs>
-          <linearGradient id="logoGrad" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#8b84ff"/>
-            <stop offset="100%" stop-color="#5b4fd1"/>
-          </linearGradient>
-        </defs>
-        <rect x="1" y="1" width="30" height="30" rx="8" fill="url(#logoGrad)"
-              stroke="rgba(255,255,255,.08)" stroke-width="1"/>
-        <circle cx="16" cy="13" r="5.5" stroke="#fff" stroke-width="1.4" fill="none" opacity=".95"/>
-        <ellipse cx="16" cy="13" rx="2.4" ry="5.5" stroke="#fff" stroke-width="1.4" fill="none" opacity=".95"/>
-        <line x1="10.5" y1="13" x2="21.5" y2="13" stroke="#fff" stroke-width="1.4" opacity=".95"/>
-        <path d="M16 21 L16 26 M12.5 23 L16 26.5 L19.5 23"
-              stroke="#fff" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-      </svg>
-      <h1>Asimov Site Downloader</h1>
-    </div>
-    <p class="subtitle">
-      Insira a URL de qualquer site e receba um ZIP com a versão offline completa —
-      HTML, CSS, JavaScript, fontes, imagens e vídeos. Preserva animações, parallax
-      e sites renderizados via JavaScript (Next.js, SPAs, Webflow, Aura).
-    </p>
 
-    <div class="input-wrap">
-      <input type="url" id="url" placeholder="https://exemplo.com" autocomplete="off" />
-    </div>
+<!-- BACKGROUND CANVAS (particle network) -->
+<canvas class="bg-canvas" id="particles" aria-hidden="true"></canvas>
+<div class="bg-glow" aria-hidden="true"></div>
+<div class="bg-vignette" aria-hidden="true"></div>
 
-    <button id="grab" onclick="startGrab()">
-      <span id="btn-label">Baixar Site</span>
-      <div class="spinner" id="spin"></div>
-    </button>
-
-    <div class="log-box" id="logs"></div>
-
-    <div class="success-bar" id="ok">
-      <span>Download pronto!</span>
-      <a id="dl-link" href="#">Baixar ZIP</a>
-    </div>
+<!-- HUD CORNERS -->
+<div class="hud-overlay" aria-hidden="true">
+  <div class="hud-tl"></div>
+  <div class="hud-tr"></div>
+  <div class="hud-bl"></div>
+  <div class="hud-br"></div>
+  <div class="hud-status">
+    <span class="dot"></span>
+    <span>asimov · pipeline ativo</span>
   </div>
+</div>
 
-  <script>
-    let es = null;
+<!-- STAGE -->
+<main class="stage">
+  <section class="card" aria-label="Asimov Site Downloader">
+    <span class="br br-tl"></span>
+    <span class="br br-tr"></span>
+    <span class="br br-bl"></span>
+    <span class="br br-br"></span>
 
-    function startGrab() {
-      const url = document.getElementById('url').value.trim();
-      if (!url) { alert('Insira uma URL válida.'); return; }
+    <div class="card-head">
+      <div class="left">
+        <div class="dots">
+          <span class="live"></span>
+          <span></span>
+          <span></span>
+        </div>
+        <span>asimov://capture</span>
+      </div>
+      <div class="right">
+        <span class="pulse"></span>
+        <span id="head-status">pronto</span>
+      </div>
+    </div>
 
-      clearLogs();
-      closeSuccess();
-      setLoading(true);
+    <div class="card-body">
+      <div class="brand">
+        <span class="mark">A</span>
+        <span class="name">Asimov Site Downloader <span class="accent">2.0</span></span>
+      </div>
 
-      fetch('/start-download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url })
-      })
+      <p class="desc">
+        Capture qualquer site em um <b>ZIP offline</b> completo. HTML, CSS, JS, fontes, imagens — preservando <b>animações</b> e <b>SPAs</b>.
+      </p>
+
+      <div class="form-label">
+        <span class="accent">›</span>
+        <span>URL alvo</span>
+      </div>
+
+      <form class="form-row" onsubmit="event.preventDefault(); startGrab();">
+        <div class="input-wrap">
+          <input
+            type="url"
+            id="url"
+            placeholder="https://exemplo.com"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="URL do site a capturar"
+          />
+        </div>
+        <button type="submit" id="grab" class="grab-btn">
+          <span id="btn-label">Baixar Site</span>
+          <div class="spinner" id="spin" aria-hidden="true"></div>
+          <span class="arrow" id="btn-arrow">→</span>
+        </button>
+      </form>
+
+      <!-- LOG PANEL -->
+      <div class="log-shell" id="log-shell" aria-live="polite">
+        <div class="log-head">
+          <div class="left">
+            <div class="scan"></div>
+            <span>stream // grabber.py</span>
+          </div>
+          <div class="right">
+            <div class="dot"></div>
+            <span>ao vivo</span>
+          </div>
+        </div>
+        <div class="log-body" id="logs" role="log"></div>
+      </div>
+
+      <!-- SUCCESS BAR -->
+      <div class="success-shell" id="ok">
+        <div class="success-icon">
+          <iconify-icon icon="solar:check-circle-bold" width="20" height="20"></iconify-icon>
+        </div>
+        <div class="success-text">
+          <div class="title">Captura concluída</div>
+          <div class="meta">Seu ZIP está pronto para download.</div>
+        </div>
+        <a class="success-link" id="dl-link" href="#" download>
+          <iconify-icon icon="solar:download-minimalistic-bold" width="13" height="13"></iconify-icon>
+          Baixar ZIP
+        </a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+  /* ============================================================
+     PARTICLE BACKGROUND (canvas, mint-tinted) — fullscreen
+     ============================================================ */
+  (function particles() {
+    const canvas = document.getElementById('particles');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    let w, h, dots, raf;
+    const DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+    function resize() {
+      w = canvas.width = window.innerWidth * DPR;
+      h = canvas.height = window.innerHeight * DPR;
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      seed();
+    }
+    function seed() {
+      const N = Math.floor((window.innerWidth * window.innerHeight) / 16000);
+      dots = Array.from({ length: N }, () => ({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        vx: (Math.random() - 0.5) * 0.25 * DPR,
+        vy: (Math.random() - 0.5) * 0.25 * DPR,
+        r: (Math.random() * 1.4 + 0.4) * DPR,
+        a: Math.random() * 0.5 + 0.2
+      }));
+    }
+    function draw() {
+      ctx.clearRect(0, 0, w, h);
+      for (const d of dots) {
+        d.x += d.vx; d.y += d.vy;
+        if (d.x < 0 || d.x > w) d.vx *= -1;
+        if (d.y < 0 || d.y > h) d.vy *= -1;
+        ctx.beginPath();
+        ctx.fillStyle = `rgba(0, 255, 163, ${d.a})`;
+        ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      const MAX = 130 * DPR;
+      for (let i = 0; i < dots.length; i++) {
+        for (let j = i + 1; j < dots.length; j++) {
+          const dx = dots[i].x - dots[j].x;
+          const dy = dots[i].y - dots[j].y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < MAX) {
+            const op = (1 - dist / MAX) * 0.18;
+            ctx.beginPath();
+            ctx.strokeStyle = `rgba(0, 255, 163, ${op})`;
+            ctx.lineWidth = 0.5 * DPR;
+            ctx.moveTo(dots[i].x, dots[i].y);
+            ctx.lineTo(dots[j].x, dots[j].y);
+            ctx.stroke();
+          }
+        }
+      }
+      raf = requestAnimationFrame(draw);
+    }
+    let resizeT;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeT);
+      resizeT = setTimeout(resize, 120);
+    });
+    resize();
+    draw();
+  })();
+
+  /* ============================================================
+     REAL CAPTURE — POST /start-download → SSE /stream/<sid> → /download-file/<sid>
+     ============================================================ */
+  let es = null;
+  let cursorEl = null;
+
+  function startGrab() {
+    const input = document.getElementById('url');
+    let url = input.value.trim();
+    if (!url) {
+      flashError(input);
+      return;
+    }
+    if (!/^https?:\/\//i.test(url)) {
+      url = 'https://' + url;
+      input.value = url;
+    }
+
+    setLoading(true);
+    setHeadStatus('capturando');
+    closeSuccess();
+    clearLogs();
+    openLogs();
+    addCursor();
+
+    fetch('/start-download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    })
       .then(r => r.json())
       .then(data => {
-        if (data.error) { addLog('❌ ' + data.error, true); setLoading(false); return; }
+        if (data.error) {
+          removeCursor();
+          addLog('Erro: ' + data.error, 'err');
+          setHeadStatus('falhou');
+          setLoading(false);
+          return;
+        }
         listenSSE(data.session_id);
       })
-      .catch(err => { addLog('❌ ' + err.message, true); setLoading(false); });
-    }
-
-    function listenSSE(sid) {
-      es = new EventSource('/stream/' + sid);
-
-      es.onmessage = e => addLog(e.data);
-
-      es.addEventListener('done', e => {
-        es.close();
-        if (e.data === 'complete') {
-          triggerDownload(sid);
-          showSuccess(sid);
-        }
-        setTimeout(() => setLoading(false), 500);
+      .catch(err => {
+        removeCursor();
+        addLog('Erro de rede: ' + err.message, 'err');
+        setHeadStatus('falhou');
+        setLoading(false);
       });
+  }
 
-      es.onerror = () => { es.close(); setLoading(false); };
-    }
+  function listenSSE(sid) {
+    es = new EventSource('/stream/' + sid);
 
-    function triggerDownload(sid) {
-      const a = document.createElement('a');
-      a.href = '/download-file/' + sid;
-      a.click();
-      document.getElementById('dl-link').href = '/download-file/' + sid;
-    }
+    es.onmessage = e => addLog(e.data);
 
-    function setLoading(on) {
-      document.getElementById('grab').disabled = on;
-      document.getElementById('url').disabled = on;
-      document.getElementById('spin').style.display = on ? 'block' : 'none';
-      document.getElementById('btn-label').textContent = on ? 'Processando...' : 'Baixar Site';
-      if (on) document.getElementById('logs').classList.add('open');
-    }
-
-    function addLog(msg, isErr = false) {
-      const box = document.getElementById('logs');
-      const d = document.createElement('div');
-      d.className = 'log-line' + (isErr ? ' err' : '');
-      d.textContent = msg;
-      box.appendChild(d);
-      box.scrollTop = box.scrollHeight;
-    }
-
-    function clearLogs() {
-      // Only clear contents — visibility is controlled by setLoading()
-      document.getElementById('logs').innerHTML = '';
-    }
-
-    function showSuccess(sid) {
-      document.getElementById('ok').classList.add('open');
-    }
-
-    function closeSuccess() {
-      document.getElementById('ok').classList.remove('open');
-    }
-
-    document.getElementById('url').addEventListener('keydown', e => {
-      if (e.key === 'Enter' && !document.getElementById('grab').disabled) startGrab();
+    es.addEventListener('done', e => {
+      es.close();
+      es = null;
+      removeCursor();
+      if (e.data === 'complete') {
+        setHeadStatus('concluído');
+        triggerDownload(sid);
+        showSuccess(sid);
+      } else {
+        setHeadStatus('falhou');
+      }
+      setTimeout(() => setLoading(false), 400);
     });
-  </script>
+
+    es.onerror = () => {
+      if (es) { es.close(); es = null; }
+      removeCursor();
+      setHeadStatus('desconectado');
+      setLoading(false);
+    };
+  }
+
+  function triggerDownload(sid) {
+    const href = '/download-file/' + sid;
+    const a = document.createElement('a');
+    a.href = href;
+    a.click();
+    document.getElementById('dl-link').href = href;
+  }
+
+  /* ============================================================
+     UI helpers
+     ============================================================ */
+  function setLoading(on) {
+    const btn = document.getElementById('grab');
+    const lbl = document.getElementById('btn-label');
+    const arr = document.getElementById('btn-arrow');
+    const inp = document.getElementById('url');
+    btn.disabled = on;
+    inp.disabled = on;
+    if (on) {
+      btn.classList.add('loading');
+      lbl.textContent = 'Capturando';
+      arr.style.display = 'none';
+    } else {
+      btn.classList.remove('loading');
+      lbl.textContent = 'Baixar Site';
+      arr.style.display = '';
+    }
+  }
+
+  function setHeadStatus(text) {
+    const el = document.getElementById('head-status');
+    if (el) el.textContent = text;
+  }
+
+  function flashError(input) {
+    input.focus();
+    const wrap = input.closest('.input-wrap');
+    wrap.style.borderColor = '#ff5577';
+    wrap.style.boxShadow = '0 0 0 1px #ff5577, 0 0 18px rgba(255,85,119,0.18)';
+    setTimeout(() => {
+      wrap.style.borderColor = '';
+      wrap.style.boxShadow = '';
+    }, 1400);
+  }
+
+  function openLogs() {
+    document.getElementById('log-shell').classList.add('open');
+  }
+
+  function clearLogs() {
+    document.getElementById('logs').innerHTML = '';
+  }
+
+  /* Detect line type from leading emoji / keywords. */
+  function classifyLine(text) {
+    const t = text.trim();
+    if (/^(❌|⛔|🚫|✗)/.test(t) || /^erro/i.test(t) || /falhou/i.test(t)) return 'err';
+    if (/^(⚠️|⚠)/.test(t) || /aviso/i.test(t)) return 'warn';
+    if (/^(✅|✔|✓|🎉|🟢)/.test(t) || /pronto/i.test(t) || /conclu(í|i)d/i.test(t)) return 'ok';
+    return '';
+  }
+
+  function addLog(text, forcedClass) {
+    const box = document.getElementById('logs');
+    const ts = nowTS();
+    const cls = forcedClass || classifyLine(text);
+    const el = document.createElement('div');
+    el.className = 'log-line ' + cls;
+    el.innerHTML = `
+      <span class="ts">${ts}</span>
+      <span class="ic">${cls === 'err' ? '✗' : cls === 'warn' ? '!' : cls === 'ok' ? '✓' : '›'}</span>
+      <span class="msg"></span>
+    `;
+    el.querySelector('.msg').textContent = text;
+    if (cursorEl && cursorEl.parentNode === box) {
+      box.insertBefore(el, cursorEl);
+    } else {
+      box.appendChild(el);
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function addCursor() {
+    const box = document.getElementById('logs');
+    cursorEl = document.createElement('div');
+    cursorEl.className = 'cursor-line';
+    cursorEl.innerHTML = `
+      <span class="ts">${nowTS()}</span>
+      <span class="ic">›</span>
+      <span class="blink"></span>
+    `;
+    box.appendChild(cursorEl);
+  }
+
+  function removeCursor() {
+    if (cursorEl && cursorEl.parentNode) {
+      cursorEl.parentNode.removeChild(cursorEl);
+      cursorEl = null;
+    }
+  }
+
+  function nowTS() {
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function showSuccess(sid) {
+    document.getElementById('ok').classList.add('open');
+  }
+
+  function closeSuccess() {
+    document.getElementById('ok').classList.remove('open');
+  }
+
+  /* enter key triggers grab */
+  document.getElementById('url').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !document.getElementById('grab').disabled) {
+      e.preventDefault();
+      startGrab();
+    }
+  });
+</script>
+
 </body>
 </html>
