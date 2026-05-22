@@ -52,7 +52,13 @@ These are why dynamically-built URLs work offline. Don't strip them lightly. All
 1. **Early head script (`data-offline-resolve`)**: Inlines the full `_url_map` as JS, then patches the property setters of `HTMLScriptElement.src`, `HTMLLinkElement.href`, `HTMLImageElement.src/srcset`, `HTMLSourceElement`, `HTMLMediaElement`, `HTMLIFrameElement`, plus `Element.prototype.setAttribute`. So when Next.js does `el.src = "/_next/static/chunks/foo.js"` at runtime, the setter rewrites it to the local asset before the browser fetches. Map is keyed by both full URL and `pathname+search` (because `file://` resolution loses the origin). Special-cases `/_next/image?url=...` by peeling the inner CDN URL. Prefers `window.__offlineDataUri` (see below) for textures.
 2. **Late body script (`data-offline-fix`)**: MutationObserver that re-rewrites img `src`/`srcset` after hydration. Also force-reveals GSAP-pinned elements (`opacity:0` + transforms) after 5 s, since ScrollTrigger pinning often misbehaves locally. Also retries `UnicornStudio.init()` because the captured page already has the loader script + an `if(!window.UnicornStudio)…` guard that bails out in offline mode.
 3. **Runtime cache (`data-offline-runtime`)**: Patches `fetch`/`XMLHttpRequest` to answer from an in-page base64 cache (`_build_runtime_cache` — UnicornStudio scene JSON, its textures, icon-set JSON). `file://` blocks every `fetch()`, and a `file://` image used as a WebGL texture CORS-taints the canvas; serving from the cache (Response objects / `__offlineDataUri` data: URIs) sidesteps both.
-4. **Aura sandbox scripts** — see below; only emitted for site-builder previews.
+4. **Aura sandbox scripts** / **ES-module SPA loader (`data-offline-esm`)** — see below; emitted only when the page needs them.
+
+### ES-module SPAs (`_inject_module_loader`)
+
+Native ES module loading is **forbidden from `file://`** — the origin is `null`, so every `<script type="module">` fetch (and every `import`) counts as cross-origin and Chrome blocks it. So a Vite/Angular/etc. SPA whose entry is `<script type="module" src>` cannot run offline at all; the old answer was to CSR-strip it to a frozen static snapshot.
+
+When `_rewrite_html` sees an external module script it sets `self._module_app` (and forces `_is_csr = False` so the scripts survive). `_collect_app_modules` then BFS-walks the module graph from each entry, rewriting every intra-graph import to a bare asset filename. `_inject_module_loader` rebuilds each module as a `blob:` URL (exempt from the `file://` restriction), installs a runtime import map (`filename` / `./filename` / `assets/filename` → blob URL), and re-adds the entry as a module script. It also injects two shims an offline SPA needs: a `<base href>` equal to the document URL (so a History-API router resolves `/` instead of the file path → otherwise blank page) and a `history.pushState/replaceState` wrapper that swallows the `SecurityError` thrown against a null origin. `<link rel=modulepreload>` is dropped.
 
 ### Aura site-builder previews (`_inject_aura_sandbox`)
 
@@ -64,7 +70,7 @@ Aura previews don't ship a static page — a sandbox iframe Babel-transpiles the
 
 ### CSR detection
 
-`_detect_csr` flags pages where the body has <50 chars of text and ≤3 divs (pure SPA shell). For these, we **strip all scripts** during HTML rewrite — the rendered DOM is already in the snapshot, and keeping the JS would just trigger failed API calls that blank the page.
+`_detect_csr` flags pages where the body has <50 chars of text and ≤3 divs (pure SPA shell). For these, we **strip all scripts** during HTML rewrite — the rendered DOM is already in the snapshot, and keeping the JS would just trigger failed API calls that blank the page. **Exception:** if the page is an ES-module SPA (`_module_app`), the script-strip is skipped — `_inject_module_loader` re-runs the app via `blob:` URLs instead, which restores animations/interactivity a frozen snapshot loses.
 
 ## Deployment constraints
 

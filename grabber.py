@@ -123,6 +123,7 @@ class SiteGrabber:
         self._base_url: str = url
         self._is_csr: bool = False           # True → CSR app, strip JS on output
         self._aura_modules_msg: dict | None = None  # captured Aura sandbox UPDATE_MODULES
+        self._module_app: bool = False       # True → ES-module SPA, blob-load it
 
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
@@ -1111,6 +1112,165 @@ class SiteGrabber:
             f"   🗃️  Cache de runtime: {len(cache['entries'])} resposta(s) embutida(s)"
         )
 
+    # ── ES-module SPA offline replay ──────────────────────────────────────────
+
+    def _collect_app_modules(self, soup) -> tuple[dict, list]:
+        """
+        BFS the page's own ES-module graph from every <script type="module"
+        src> entry, rewriting each intra-graph import to the bare asset
+        filename of its target. Returns ({filename: rewritten_source},
+        [entry_filename]). _inject_module_loader turns those into blob: URLs.
+        """
+        from urllib.parse import unquote
+
+        local_to_orig: dict[str, str] = {}
+        for orig, local in self._url_map.items():
+            local_to_orig.setdefault(local, orig)
+        norm: dict[str, str] = {}            # url (raw + decoded) → filename
+        for orig, local in self._url_map.items():
+            fn = local.split("/")[-1]
+            norm.setdefault(orig, fn)
+            norm.setdefault(unquote(orig), fn)
+
+        entries: list[str] = []
+        for tag in soup.find_all("script", attrs={"type": "module", "src": True}):
+            fn = (tag.get("src") or "").split("/")[-1]
+            if fn and os.path.isfile(os.path.join(self.assets_dir, fn)):
+                entries.append(fn)
+        if not entries:
+            return {}, []
+
+        spec_re = re.compile(
+            r'(\bfrom\s*|\bimport\s*\(\s*|\bimport\s*)(["\'])([^"\']+)\2'
+        )
+
+        modules: dict[str, str] = {}
+        queue = list(entries)
+        seen: set[str] = set()
+        while queue:
+            fn = queue.pop(0)
+            if fn in seen:
+                continue
+            seen.add(fn)
+            path = os.path.join(self.assets_dir, fn)
+            if not os.path.isfile(path):
+                continue
+            base = local_to_orig.get(f"assets/{fn}", "")
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except Exception:
+                continue
+
+            def repl(m: re.Match) -> str:
+                pre, quote, spec = m.group(1), m.group(2), m.group(3)
+                if spec.startswith(("data:", "blob:", "node:")):
+                    return m.group(0)
+                if not spec.startswith(("/", "./", "../", "http://", "https://")):
+                    return m.group(0)
+                abs_url = spec if spec.startswith("http") else urljoin(base, spec)
+                tgt = norm.get(abs_url) or norm.get(unquote(abs_url))
+                if not tgt:
+                    return m.group(0)
+                if tgt not in seen:
+                    queue.append(tgt)
+                return f"{pre}{quote}{tgt}{quote}"
+
+            modules[fn] = spec_re.sub(repl, text)
+
+        ordered_entries = []
+        for e in entries:
+            if e in modules and e not in ordered_entries:
+                ordered_entries.append(e)
+        return modules, ordered_entries
+
+    def _inject_module_loader(self, soup) -> None:
+        """
+        Rebuild an ES-module SPA (Vite, Angular, …) so it runs from file://.
+
+        file:// forbids loading ES modules (null origin → cross-origin). The
+        loader rebuilds the captured module graph as blob: URLs — which are
+        exempt — and re-adds the entry as a module script. It also installs
+        two compatibility shims an offline SPA needs:
+
+          • <base href> set to the document URL, so a router using
+            PathLocationStrategy / the History API resolves '/' instead of
+            the file path (otherwise it matches no route → blank page).
+          • history.pushState/replaceState wrapped to swallow the
+            SecurityError they throw against a null (file://) origin, which
+            would otherwise abort the app's bootstrap.
+
+        <link rel=modulepreload> tags are dropped — they can't preload
+        file:// modules and only emit CORS noise.
+        """
+        if not self._module_app:
+            return
+        modules, entries = self._collect_app_modules(soup)
+        if not modules or not entries:
+            return
+        head = soup.find("head")
+        if head is None:
+            return
+        import json as _json
+
+        for tag in soup.find_all("script", attrs={"type": "module", "src": True}):
+            tag.decompose()
+        for tag in soup.find_all("link"):
+            rel = tag.get("rel", [])
+            rel = " ".join(rel) if isinstance(rel, list) else str(rel or "")
+            if "modulepreload" in rel or ("preload" in rel and tag.get("as") == "script"):
+                tag.decompose()
+
+        payload = _json.dumps(
+            {"sources": modules, "entries": entries}
+        ).replace("</", "<\\/")
+        loader = soup.new_tag("script")
+        loader["data-offline-esm"] = "1"
+        loader.string = (
+            "(function(){\n"
+            "if (location.protocol === 'file:') {\n"
+            "  // SPA router needs '/' — give it a <base> equal to this doc.\n"
+            "  try {\n"
+            "    var bs = document.createElement('base');\n"
+            "    bs.href = location.href;\n"
+            "    var h0 = document.head || document.documentElement;\n"
+            "    h0.insertBefore(bs, h0.firstChild);\n"
+            "  } catch(e){}\n"
+            "  // pushState/replaceState throw on a null origin — swallow it.\n"
+            "  ['pushState','replaceState'].forEach(function(m){\n"
+            "    var orig = history[m];\n"
+            "    history[m] = function(){\n"
+            "      try { return orig.apply(this, arguments); } catch(e){}\n"
+            "    };\n"
+            "  });\n"
+            "}\n"
+            "var D = " + payload + ";\n"
+            "var urls = {};\n"
+            "for (var fn in D.sources) {\n"
+            "  try { urls[fn] = URL.createObjectURL(\n"
+            "    new Blob([D.sources[fn]], {type:'text/javascript'})); } catch(e){}\n"
+            "}\n"
+            "var imports = {};\n"
+            "for (var fn in urls) {\n"
+            "  imports[fn] = urls[fn];\n"
+            "  imports['./' + fn] = urls[fn];\n"
+            "  imports['assets/' + fn] = urls[fn];\n"
+            "}\n"
+            "var im = document.createElement('script');\n"
+            "im.type = 'importmap';\n"
+            "im.textContent = JSON.stringify({imports: imports});\n"
+            "(document.head || document.documentElement).appendChild(im);\n"
+            "D.entries.forEach(function(e){\n"
+            "  if (!urls[e]) return;\n"
+            "  var s = document.createElement('script');\n"
+            "  s.type = 'module'; s.src = urls[e];\n"
+            "  (document.head || document.documentElement).appendChild(s);\n"
+            "});\n"
+            "})();"
+        )
+        head.insert(0, loader)
+        self.log(f"   📦 SPA de módulos: {len(modules)} módulo(s) via blob URL")
+
     # ── CSR detection ─────────────────────────────────────────────────────────
 
     def _detect_csr(self, html: str) -> bool:
@@ -1187,6 +1347,17 @@ class SiteGrabber:
         # Remove <base> — it would resolve local paths against the original host
         for tag in soup.find_all("base"):
             tag.decompose()
+
+        # ── Detect an ES-module SPA (Vite / Angular / etc.) ───────────────────
+        # A <script type="module" src> app cannot load at all from file://:
+        # the origin is `null`, so every module fetch is cross-origin and
+        # Chrome blocks it. _inject_module_loader rebuilds the module graph as
+        # blob: URLs and re-runs the app. Keep the scripts (don't CSR-strip) —
+        # a static snapshot would just freeze the page, and the loader needs
+        # the <script> tags to discover the entry points.
+        if soup.find("script", attrs={"type": "module", "src": True}) is not None:
+            self._module_app = True
+            self._is_csr = False
 
         # Strip SRI / CORS attributes that block local file loading
         for tag in soup.find_all(["script", "link"]):
@@ -1461,6 +1632,14 @@ class SiteGrabber:
                 "    var url = new URL(u, location.href);\n"
                 "    var pq = url.pathname + url.search;\n"
                 "    if (ASSET_MAP[pq]) return ASSET_MAP[pq];\n"
+                "    // The snapshot may be opened from a subdirectory, while\n"
+                "    // ASSET_MAP paths are origin-rooted. Retry with the\n"
+                "    // document's own directory prefix stripped off.\n"
+                "    var dir = location.pathname.replace(/[^/]*$/, '');\n"
+                "    if (dir.length > 1 && pq.indexOf(dir) === 0) {\n"
+                "      var rel = pq.slice(dir.length - 1);\n"
+                "      if (ASSET_MAP[rel]) return ASSET_MAP[rel];\n"
+                "    }\n"
                 "    // Next.js image optimization wrapper — peel the inner CDN URL\n"
                 "    if (/_next\\/image$/.test(url.pathname)) {\n"
                 "      var t = url.searchParams.get('url');\n"
@@ -1560,6 +1739,9 @@ class SiteGrabber:
 
         # ── Aura sandbox: replay project source for offline re-render ─────────
         self._inject_aura_sandbox(soup)
+
+        # ── ES-module SPA: rebuild the module graph as blob: URLs ─────────────
+        self._inject_module_loader(soup)
 
         # ── Inject late offline-fix at end of body ────────────────────────────
         body = soup.find("body")
