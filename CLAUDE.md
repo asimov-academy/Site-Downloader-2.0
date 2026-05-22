@@ -45,12 +45,22 @@ The whole point is the ordering of these phases. Reordering breaks things.
 - **Phase 3 — CSS rewrite**: Two-pass design. We rewrite CSS *after* all assets (especially fonts/images referenced by `url()` and `@import`) are mapped, so `_rewrite_css` can resolve them. CSS files use `in_assets=True` (bare filename siblings); inline `<style>`/`style=""` use `in_assets=False` (`assets/filename`).
 - **Phase 4 — HTML rewrite** (`_rewrite_html`): Strips `<base>`, SRI/CORS attrs (block local loads), removes "already-initialized" markers from libs like Unicorn Studio (`data-us-initialized` + child `<canvas>`), then rewrites `src`/`href`/`srcset`/lazy-data-attrs/SVG `<use>`/inline styles.
 
-### Critical: the two injected scripts in the rewritten HTML
+### Critical: the injected scripts in the rewritten HTML
 
-These are why dynamically-built URLs work offline. Don't strip them lightly.
+These are why dynamically-built URLs work offline. Don't strip them lightly. All are stringified Python in `_rewrite_html` / its helpers.
 
-1. **Early head script (`data-offline-resolve`)**: Inlines the full `_url_map` as JS, then patches the property setters of `HTMLScriptElement.src`, `HTMLLinkElement.href`, `HTMLImageElement.src/srcset`, `HTMLSourceElement`, `HTMLMediaElement`, `HTMLIFrameElement`, plus `Element.prototype.setAttribute`. So when Next.js does `el.src = "/_next/static/chunks/foo.js"` at runtime, the setter rewrites it to the local asset before the browser fetches. Map is keyed by both full URL and `pathname+search` (because `file://` resolution loses the origin). Special-cases `/_next/image?url=...` by peeling the inner CDN URL.
+1. **Early head script (`data-offline-resolve`)**: Inlines the full `_url_map` as JS, then patches the property setters of `HTMLScriptElement.src`, `HTMLLinkElement.href`, `HTMLImageElement.src/srcset`, `HTMLSourceElement`, `HTMLMediaElement`, `HTMLIFrameElement`, plus `Element.prototype.setAttribute`. So when Next.js does `el.src = "/_next/static/chunks/foo.js"` at runtime, the setter rewrites it to the local asset before the browser fetches. Map is keyed by both full URL and `pathname+search` (because `file://` resolution loses the origin). Special-cases `/_next/image?url=...` by peeling the inner CDN URL. Prefers `window.__offlineDataUri` (see below) for textures.
 2. **Late body script (`data-offline-fix`)**: MutationObserver that re-rewrites img `src`/`srcset` after hydration. Also force-reveals GSAP-pinned elements (`opacity:0` + transforms) after 5 s, since ScrollTrigger pinning often misbehaves locally. Also retries `UnicornStudio.init()` because the captured page already has the loader script + an `if(!window.UnicornStudio)…` guard that bails out in offline mode.
+3. **Runtime cache (`data-offline-runtime`)**: Patches `fetch`/`XMLHttpRequest` to answer from an in-page base64 cache (`_build_runtime_cache` — UnicornStudio scene JSON, its textures, icon-set JSON). `file://` blocks every `fetch()`, and a `file://` image used as a WebGL texture CORS-taints the canvas; serving from the cache (Response objects / `__offlineDataUri` data: URIs) sidesteps both.
+4. **Aura sandbox scripts** — see below; only emitted for site-builder previews.
+
+### Aura site-builder previews (`_inject_aura_sandbox`)
+
+Aura previews don't ship a static page — a sandbox iframe Babel-transpiles the project at runtime. The project source arrives via a `postMessage` `UPDATE_MODULES` from the parent and **never touches the DOM**, so a plain snapshot freezes (dead canvases, no animations). Three things make it re-render offline:
+
+- **Module capture**: a Playwright `add_init_script` records the `UPDATE_MODULES` message into `self._aura_modules_msg` during the grab.
+- **`data-offline-sandbox` responder**: replays that message on every `SANDBOX_READY` the sandbox emits (offline there is no parent). Also swaps `BrowserRouter`→`MemoryRouter` in the bundle — a `file://` document path matches no route → blank page.
+- **`data-offline-esm` loader**: native ES module loading is forbidden from `file://` (null origin → every fetch is cross-origin). `_collect_esm_modules` rewrites each captured esm.sh module's imports to bare filenames; the loader rebuilds them as `blob:` URLs (exempt from the restriction) and installs a runtime import map. The original esm.sh `<script type="importmap">` is dropped.
 
 ### CSR detection
 
@@ -64,7 +74,7 @@ These are why dynamically-built URLs work offline. Don't strip them lightly.
 
 ## When modifying the grabber
 
-- Test against a real JS-heavy site (Next.js + Aura/Webflow previews are the stress cases) and **open the resulting `index.html` from `file://`** — `http://` masks the path-resolution bugs the injected scripts exist to fix.
+- Test against a real JS-heavy site (Next.js + Aura/Webflow previews are the stress cases) and **open the resulting `index.html` from `file://` with the network blocked** — `http://`, or even `file://` while online, masks the bugs: remote `esm.sh`/CDN/font requests silently succeed and hide that they were never made local. Block all non-`file:`/`data:`/`blob:` requests when verifying.
 - The `_url_map` must be populated before CSS rewriting (Phase 3) and HTML rewriting (Phase 4). Adding a new asset source means hooking it before Phase 3.
 - New URL attributes (custom `data-*`, framework-specific) go in both `_collect_remote_urls` (so fallback fetches them) and `_rewrite_html` (so the saved HTML points to the local copy).
 - The injected runtime scripts are stringified Python — escaping matters. Test in a browser console after a real grab, not just by reading the source.

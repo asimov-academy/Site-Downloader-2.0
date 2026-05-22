@@ -122,6 +122,7 @@ class SiteGrabber:
         self._captured: dict[str, dict] = {} # url → {body, content_type}
         self._base_url: str = url
         self._is_csr: bool = False           # True → CSR app, strip JS on output
+        self._aura_modules_msg: dict | None = None  # captured Aura sandbox UPDATE_MODULES
 
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
@@ -491,6 +492,18 @@ class SiteGrabber:
         frame_url = frame.url or ""
         base = frame_url if frame_url not in ("", "about:blank", "about:srcdoc") else page.url
 
+        # Grab the Aura sandbox's project source (UPDATE_MODULES postMessage,
+        # recorded by the init script) so the app can re-render offline.
+        try:
+            msg = frame.evaluate("() => window.__AURA_CAPTURED_UPDATE_MODULES")
+            if msg and isinstance(msg, dict) and msg.get("modules"):
+                self._aura_modules_msg = msg
+                self.log(
+                    f"📨 Sandbox Aura detectado — {len(msg['modules'])} módulo(s) capturado(s)"
+                )
+        except Exception:
+            pass
+
         # Scroll the frame so all sections render (the SPA only paints what's visible)
         self._scroll_frame(frame, page)
 
@@ -758,6 +771,345 @@ class SiteGrabber:
             pass
 
         return saved
+
+    # ── Aura sandbox offline replay ───────────────────────────────────────────
+
+    def _collect_esm_modules(self) -> tuple[dict, dict]:
+        """
+        Collect captured esm.sh modules and rewrite their cross-references for
+        blob-based offline loading.
+
+        Native ES module loading is forbidden from file:// pages: the origin
+        is `null`, so every module fetch counts as cross-origin and Chrome
+        blocks it. blob: URLs are exempt. _inject_aura_sandbox rebuilds each
+        module as a Blob at runtime and wires the graph together through an
+        injected import map (filename → blob URL). For that to work, every
+        intra-graph import here is rewritten to the bare asset filename of its
+        target. Bare specifiers ('react') are left alone — the import map
+        carries an alias for them too.
+
+        Returns (modules, esm_index):
+          modules   = { asset_filename: source_with_imports_rewritten }
+          esm_index = { esm.sh_url: asset_filename }  (raw + percent-decoded)
+        """
+        from urllib.parse import unquote
+
+        local_to_orig: dict[str, str] = {}
+        for orig, local in self._url_map.items():
+            local_to_orig.setdefault(local, orig)
+
+        # esm.sh url → filename, indexed raw *and* percent-decoded so a
+        # specifier like '/scheduler@^0.23.2' matches a captured '%5E0.23.2'.
+        esm_index: dict[str, str] = {}
+        for orig, local in self._url_map.items():
+            if "esm.sh" in urlparse(orig).netloc:
+                fn = local.split("/")[-1]
+                esm_index.setdefault(orig, fn)
+                esm_index.setdefault(unquote(orig), fn)
+
+        esm_files = sorted(
+            fn for fn in os.listdir(self.assets_dir)
+            if "esm.sh" in urlparse(local_to_orig.get(f"assets/{fn}", "")).netloc
+        )
+        if not esm_files:
+            return {}, {}
+
+        # from "x" | import("x") | import "x"  (covers export … from "x" too)
+        spec_re = re.compile(
+            r'(\bfrom\s*|\bimport\s*\(\s*|\bimport\s*)(["\'])([^"\']+)\2'
+        )
+
+        modules: dict[str, str] = {}
+        for fn in esm_files:
+            base = local_to_orig.get(f"assets/{fn}", "")
+            try:
+                with open(os.path.join(self.assets_dir, fn),
+                          "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except Exception:
+                continue
+
+            def repl(m: re.Match) -> str:
+                pre, quote, spec = m.group(1), m.group(2), m.group(3)
+                if spec.startswith(("data:", "blob:", "node:")):
+                    return m.group(0)
+                # bare specifier → resolved by the injected import map
+                if not spec.startswith(("/", "./", "../", "http://", "https://")):
+                    return m.group(0)
+                abs_url = spec if spec.startswith("http") else urljoin(base, spec)
+                target = esm_index.get(abs_url) or esm_index.get(unquote(abs_url))
+                return f"{pre}{quote}{target}{quote}" if target else m.group(0)
+
+            modules[fn] = spec_re.sub(repl, text)
+
+        return modules, esm_index
+
+    def _inject_aura_sandbox(self, soup) -> None:
+        """
+        Make a captured Aura site-builder preview re-render itself offline.
+
+        Three things stop a plain snapshot from working, all fixed here:
+
+          1. The project source reaches the sandbox iframe through a
+             postMessage UPDATE_MODULES from its parent and never lands in
+             the DOM. We captured that message during the grab; the injected
+             responder script plays the parent, replaying it on every
+             SANDBOX_READY the sandbox emits.
+          2. The sandbox imports react/etc. as native ES modules, which
+             file:// forbids. The injected ESM loader rebuilds every esm.sh
+             module as a blob: URL (allowed from a null origin) and wires
+             them through a runtime import map.
+          3. React Router's BrowserRouter matches no route against a file://
+             document path → blank page. BrowserRouter is swapped for
+             MemoryRouter, which starts at '/' and ignores the URL bar.
+        """
+        if not self._aura_modules_msg:
+            return
+        head = soup.find("head")
+        if head is None:
+            return
+        import json as _json
+        import copy as _copy
+
+        # ── ESM blob loader ───────────────────────────────────────────────
+        modules, esm_index = self._collect_esm_modules()
+        if modules:
+            # specifier → filename: bare names / prefixes from the page's
+            # import map, plus every captured esm.sh URL (so a runtime
+            # import('https://esm.sh/…') built by the sandbox resolves too).
+            aliases: dict[str, str] = {}
+            im_tag = soup.find("script", attrs={"type": "importmap"})
+            if im_tag is not None and im_tag.string:
+                try:
+                    im_data = _json.loads(im_tag.string)
+                except Exception:
+                    im_data = {}
+                for key, val in (im_data.get("imports") or {}).items():
+                    if not isinstance(val, str):
+                        continue
+                    if key.endswith("/"):
+                        # prefix entry → expand to the captured siblings
+                        for url, fn in esm_index.items():
+                            if url.startswith(val):
+                                suffix = url[len(val):]
+                                if suffix and "/" not in suffix and "?" not in suffix:
+                                    aliases.setdefault(key + suffix, fn)
+                    else:
+                        fn = esm_index.get(val)
+                        if fn:
+                            aliases[key] = fn
+            for url, fn in esm_index.items():
+                aliases.setdefault(url, fn)
+
+            # The original import map points at esm.sh — drop it; the loader
+            # installs one keyed to local blob URLs instead.
+            for tag in soup.find_all("script", attrs={"type": "importmap"}):
+                tag.decompose()
+
+            payload = _json.dumps(
+                {"sources": modules, "aliases": aliases}
+            ).replace("</", "<\\/")
+            loader = soup.new_tag("script")
+            loader["data-offline-esm"] = "1"
+            loader.string = (
+                "(function(){\n"
+                "var D = " + payload + ";\n"
+                "var urls = {};\n"
+                "for (var fn in D.sources) {\n"
+                "  try { urls[fn] = URL.createObjectURL(\n"
+                "    new Blob([D.sources[fn]], {type:'text/javascript'})); }\n"
+                "  catch(e){}\n"
+                "}\n"
+                "var imports = {};\n"
+                "for (var fn in urls) imports[fn] = urls[fn];\n"
+                "for (var s in D.aliases) {\n"
+                "  var t = D.aliases[s];\n"
+                "  if (urls[t]) imports[s] = urls[t];\n"
+                "}\n"
+                "var im = document.createElement('script');\n"
+                "im.type = 'importmap';\n"
+                "im.textContent = JSON.stringify({imports: imports});\n"
+                "(document.head || document.documentElement).appendChild(im);\n"
+                "})();"
+            )
+            head.insert(0, loader)
+            self.log(f"   📦 ESM offline: {len(modules)} módulo(s) via blob URL")
+
+        # ── UPDATE_MODULES responder + router swap ────────────────────────
+        msg = _copy.deepcopy(self._aura_modules_msg)
+        mods = msg.get("modules")
+        if isinstance(mods, dict):
+            swaps = 0
+            for k, v in list(mods.items()):
+                if isinstance(v, str) and (
+                    ".BrowserRouter" in v or "createBrowserRouter" in v
+                ):
+                    mods[k] = (v.replace(".BrowserRouter", ".MemoryRouter")
+                                .replace("createBrowserRouter", "createMemoryRouter"))
+                    swaps += 1
+            if swaps:
+                self.log(f"   🔀 BrowserRouter → MemoryRouter em {swaps} módulo(s)")
+
+        # Escape </ so a stray </script> inside the bundle can't end the tag.
+        payload = _json.dumps(msg).replace("</", "<\\/")
+        responder = soup.new_tag("script")
+        responder["data-offline-sandbox"] = "1"
+        responder.string = (
+            "(function(){\n"
+            "var MSG = " + payload + ";\n"
+            "function send(){ try{ window.postMessage(MSG, '*'); }catch(e){} }\n"
+            "window.addEventListener('message', function(e){\n"
+            "  if (e && e.data && e.data.type === 'SANDBOX_READY') send();\n"
+            "});\n"
+            "function kick(){ setTimeout(send, 200); setTimeout(send, 1200);\n"
+            "  setTimeout(send, 2800); }\n"
+            "if (document.readyState === 'loading')\n"
+            "  document.addEventListener('DOMContentLoaded', kick);\n"
+            "else kick();\n"
+            "})();"
+        )
+        head.insert(0, responder)
+        self.log("   🎬 Sandbox Aura: projeto reinjetado para render offline")
+
+    # ── Runtime resource cache ────────────────────────────────────────────────
+
+    def _build_runtime_cache(self) -> dict:
+        """
+        Inline captured responses that runtime JS re-requests after load —
+        UnicornStudio scene JSON and its texture images, icon-set JSON.
+
+        Returns {"entries": [{"b": base64, "t": content_type}],
+                 "keys": {url: entry_index}}. UnicornStudio appends a
+        ?v=<timestamp> cache-buster to scene URLs, so entries are keyed by
+        both the full URL and origin+path — the latter survives the buster.
+        Bodies are content-deduplicated.
+        """
+        import base64 as _b64
+
+        entries: list[dict] = []
+        keys: dict[str, int] = {}
+        seen_hash: dict[str, int] = {}
+        total = 0
+        TOTAL_CAP = 24 * 1024 * 1024
+        ITEM_CAP = 4 * 1024 * 1024
+
+        for url, data in self._captured.items():
+            if not url.startswith("http"):
+                continue
+            body = data.get("body")
+            if not body or len(body) > ITEM_CAP:
+                continue
+            ct = (data.get("content_type") or "").split(";")[0].strip().lower()
+            host = urlparse(url).netloc.lower()
+            is_unicorn = "unicorn.studio" in host
+            is_json = ct == "application/json" or ct.endswith("+json")
+            if not (is_unicorn or (is_json and len(body) <= 512 * 1024)):
+                continue
+            if total + len(body) > TOTAL_CAP:
+                continue
+
+            h = hashlib.sha256(body).hexdigest()
+            idx = seen_hash.get(h)
+            if idx is None:
+                total += len(body)
+                idx = len(entries)
+                entries.append({
+                    "b": _b64.b64encode(body).decode("ascii"),
+                    "t": ct or "application/octet-stream",
+                })
+                seen_hash[h] = idx
+
+            keys[url] = idx
+            try:
+                pu = urlparse(url)
+                keys.setdefault(f"{pu.scheme}://{pu.netloc}{pu.path}", idx)
+            except Exception:
+                pass
+
+        return {"entries": entries, "keys": keys}
+
+    def _inject_runtime_cache(self, soup) -> None:
+        """
+        Patch fetch()/XMLHttpRequest and texture loading to answer from the
+        in-page cache built by _build_runtime_cache.
+
+        file:// blocks every fetch(), and a file:// image used as a WebGL
+        texture CORS-taints the canvas. The injected script serves captured
+        bodies as Response objects and exposes window.__offlineDataUri, which
+        the URL-resolver uses to hand textures a CORS-safe data: URI.
+        """
+        cache = self._build_runtime_cache()
+        if not cache["entries"]:
+            return
+        head = soup.find("head")
+        if head is None:
+            return
+        import json as _json
+
+        payload = _json.dumps(cache).replace("</", "<\\/")
+        script = soup.new_tag("script")
+        script["data-offline-runtime"] = "1"
+        script.string = (
+            "(function(){\n"
+            "var D = " + payload + ";\n"
+            "var E = D.entries, K = D.keys;\n"
+            "function entry(u){\n"
+            "  if (!u) return null;\n"
+            "  if (K[u] != null) return E[K[u]];\n"
+            "  try {\n"
+            "    var x = new URL(u, location.href);\n"
+            "    if (K[x.href] != null) return E[K[x.href]];\n"
+            "    var op = x.origin + x.pathname;\n"
+            "    if (K[op] != null) return E[K[op]];\n"
+            "  } catch(e){}\n"
+            "  return null;\n"
+            "}\n"
+            "function bytes(e){\n"
+            "  var s = atob(e.b), a = new Uint8Array(s.length);\n"
+            "  for (var i=0;i<s.length;i++) a[i] = s.charCodeAt(i);\n"
+            "  return a;\n"
+            "}\n"
+            "window.__offlineDataUri = function(u){\n"
+            "  var e = entry(u);\n"
+            "  return e ? ('data:' + e.t + ';base64,' + e.b) : null;\n"
+            "};\n"
+            "var _fetch = window.fetch;\n"
+            "if (_fetch) window.fetch = function(input, init){\n"
+            "  try {\n"
+            "    var u = (typeof input === 'string') ? input : (input && input.url);\n"
+            "    var e = entry(u);\n"
+            "    if (e) return Promise.resolve(new Response(bytes(e),\n"
+            "      { status:200, headers:{'Content-Type': e.t} }));\n"
+            "  } catch(err){}\n"
+            "  return _fetch.apply(this, arguments);\n"
+            "};\n"
+            "var _open = XMLHttpRequest.prototype.open;\n"
+            "XMLHttpRequest.prototype.open = function(m, u){\n"
+            "  try { this.__offUrl = u; } catch(e){}\n"
+            "  return _open.apply(this, arguments);\n"
+            "};\n"
+            "var _send = XMLHttpRequest.prototype.send;\n"
+            "XMLHttpRequest.prototype.send = function(){\n"
+            "  var e = entry(this.__offUrl);\n"
+            "  if (!e) return _send.apply(this, arguments);\n"
+            "  var self = this, txt = atob(e.b);\n"
+            "  setTimeout(function(){\n"
+            "    try {\n"
+            "      Object.defineProperty(self,'readyState',{value:4,configurable:true});\n"
+            "      Object.defineProperty(self,'status',{value:200,configurable:true});\n"
+            "      Object.defineProperty(self,'responseText',{value:txt,configurable:true});\n"
+            "      Object.defineProperty(self,'response',{value:txt,configurable:true});\n"
+            "    } catch(err){}\n"
+            "    if (typeof self.onreadystatechange === 'function') self.onreadystatechange();\n"
+            "    if (typeof self.onload === 'function') self.onload();\n"
+            "  }, 0);\n"
+            "};\n"
+            "})();"
+        )
+        head.insert(0, script)
+        self.log(
+            f"   🗃️  Cache de runtime: {len(cache['entries'])} resposta(s) embutida(s)"
+        )
 
     # ── CSR detection ─────────────────────────────────────────────────────────
 
@@ -1151,12 +1503,18 @@ class SiteGrabber:
                 "    get: desc.get,\n"
                 "    set: function(v){\n"
                 "      try {\n"
-                "        if (this.crossOrigin) {\n"
-                "          /* preserve cross-origin URL — see comment above */\n"
-                "        } else if (transform === 'srcset') {\n"
+                "        if (transform === 'srcset') {\n"
                 "          v = rewriteSrcset(v);\n"
                 "        } else {\n"
-                "          var loc = resolveLocal(v); if (loc) v = loc;\n"
+                "          // Captured runtime resource (UnicornStudio texture,\n"
+                "          // etc.) → serve as a data: URI. data: never CORS-\n"
+                "          // taints a WebGL canvas, unlike a file:// texture,\n"
+                "          // so gl.texImage2D still accepts it offline.\n"
+                "          var du = window.__offlineDataUri && window.__offlineDataUri(v);\n"
+                "          if (du) { v = du; }\n"
+                "          else if (!this.crossOrigin) {\n"
+                "            var loc = resolveLocal(v); if (loc) v = loc;\n"
+                "          }\n"
                 "        }\n"
                 "      } catch(e){}\n"
                 "      desc.set.call(this, v);\n"
@@ -1175,11 +1533,14 @@ class SiteGrabber:
                 "var _setAttr = Element.prototype.setAttribute;\n"
                 "Element.prototype.setAttribute = function(name, value){\n"
                 "  try {\n"
-                "    if (typeof value === 'string' && !this.crossOrigin) {\n"
+                "    if (typeof value === 'string') {\n"
                 "      if (name === 'src' || name === 'href') {\n"
-                "        var loc = resolveLocal(value);\n"
-                "        if (loc) value = loc;\n"
-                "      } else if (name === 'srcset') {\n"
+                "        var du = window.__offlineDataUri && window.__offlineDataUri(value);\n"
+                "        if (du) { value = du; }\n"
+                "        else if (!this.crossOrigin) {\n"
+                "          var loc = resolveLocal(value); if (loc) value = loc;\n"
+                "        }\n"
+                "      } else if (name === 'srcset' && !this.crossOrigin) {\n"
                 "        value = rewriteSrcset(value);\n"
                 "      }\n"
                 "    }\n"
@@ -1193,6 +1554,12 @@ class SiteGrabber:
             )
             # Insert at the very top of <head> so it runs before any other script
             head.insert(0, early)
+
+        # ── Serve runtime fetch()/textures from an in-page cache ──────────────
+        self._inject_runtime_cache(soup)
+
+        # ── Aura sandbox: replay project source for offline re-render ─────────
+        self._inject_aura_sandbox(soup)
 
         # ── Inject late offline-fix at end of body ────────────────────────────
         body = soup.find("body")
@@ -1422,6 +1789,25 @@ class SiteGrabber:
             )
 
             context = self._stealth_context(browser)
+
+            # Aura/site-builder previews host the real app in a sandbox iframe
+            # and feed it the project source via a postMessage UPDATE_MODULES
+            # event from the parent. That source never touches the DOM, so a
+            # plain snapshot can't replay it. Record the message in every frame
+            # so we can re-inject it offline (see _rewrite_html).
+            context.add_init_script("""
+                window.__AURA_CAPTURED_UPDATE_MODULES =
+                    window.__AURA_CAPTURED_UPDATE_MODULES || null;
+                window.addEventListener('message', function(e){
+                    try {
+                        var d = e.data;
+                        if (d && d.type === 'UPDATE_MODULES' && d.modules) {
+                            window.__AURA_CAPTURED_UPDATE_MODULES = d;
+                        }
+                    } catch (err) {}
+                }, true);
+            """)
+
             page = context.new_page()
 
             # Intercept all responses and store body+content-type
